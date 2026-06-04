@@ -21,7 +21,7 @@ class ROIView(QGraphicsView):
     ratios differ); mapToScene() inverts that scaling, turning any widget click
     straight into native-frame coordinates. No manual scale/offset math.
 
-    Drag with the left mouse button to draw a rectangular ROI.
+    Drag with the left mouse button to draw a square ROI; side = max(|dx|, |dy|).
     """
 
     roi_changed = Signal(QRectF)  # emitted on release, in native pixel coords
@@ -43,8 +43,9 @@ class ROIView(QGraphicsView):
         self._rect_item.setPen(pen)
         self._scene.addItem(self._rect_item)
 
-        self._origin = None          # drag start, in scene/native coords
         self._native_size = None     # (width, height) of the loaded frame
+        self._roi_size = 200  # square side length for Create button
+        self._origin = None          # drag start in scene/native coords
 
         self.setDragMode(QGraphicsView.NoDrag)  # we draw our own rect
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -102,6 +103,20 @@ class ROIView(QGraphicsView):
         w, h = self._native_size
         return QPointF(min(max(pt.x(), 0.0), w), min(max(pt.y(), 0.0), h))
 
+    def set_roi_size(self, px: int) -> None:
+        self._roi_size = max(1, int(px))
+
+    def _square_from_drag(self, origin, cur):
+        """Build a square QRectF from two points; side = max(|dx|, |dy|)."""
+        dx = cur.x() - origin.x()
+        dy = cur.y() - origin.y()
+        side = max(abs(dx), abs(dy))
+        if side == 0:
+            return QRectF(origin, origin)
+        x1 = origin.x() + (side if dx >= 0 else -side)
+        y1 = origin.y() + (side if dy >= 0 else -side)
+        return QRectF(origin, QPointF(x1, y1)).normalized()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self._native_size:
             self._origin = self._clamp(self.mapToScene(event.position().toPoint()))
@@ -112,16 +127,14 @@ class ROIView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self._origin is not None:
             cur = self._clamp(self.mapToScene(event.position().toPoint()))
-            # normalized() makes top-left the true min corner regardless of
-            # which direction you drag.
-            self._rect_item.setRect(QRectF(self._origin, cur).normalized())
+            self._rect_item.setRect(self._square_from_drag(self._origin, cur))
         else:
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._origin is not None:
             cur = self._clamp(self.mapToScene(event.position().toPoint()))
-            rect = QRectF(self._origin, cur).normalized()
+            rect = self._square_from_drag(self._origin, cur)
             self._origin = None
             self._rect_item.setRect(rect)
             if not rect.isNull():
@@ -133,7 +146,7 @@ class ROIView(QGraphicsView):
         self._rect_item.setRect(QRectF())
 
     def roi_native(self):
-        """ROI as ((x0, y0), (x1, y1)) integer native pixels, or None.
+        """ROI as ((x0, y0), (x1, y1), side) integer native pixels, or None.
 
         Slicing convention: crop = frame[y0:y1, x0:x1].
         """
@@ -142,4 +155,4 @@ class ROIView(QGraphicsView):
             return None
         x0, y0 = int(round(r.left())), int(round(r.top()))
         x1, y1 = int(round(r.right())), int(round(r.bottom()))
-        return (x0, y0), (x1, y1)
+        return (x0, y0), (x1, y1), x1 - x0

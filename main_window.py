@@ -1,7 +1,7 @@
 import cv2
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import Qt, QDateTime
+from PySide6.QtGui import QGuiApplication, QFont
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -71,25 +72,11 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover { background: #185a72; }
             QPushButton:pressed { background: #12475b; }
-            QFrame#StatusCard {
-                background: #ffffff;
-                border: 1px solid #d5e0e6;
-                border-radius: 8px;
-            }
-            QLabel#Title {
-                color: #17272f;
-                font-size: 24px;
-                font-weight: 800;
-            }
-            QLabel#Subtitle {
-                color: #5d7079;
-                font-size: 13px;
-            }
-            QLabel#Status {
-                color: #263840;
-                font-size: 14px;
-                line-height: 150%;
-            }
+            QFrame#StatusCard { background:#1c2529; border:1px solid #2a3a40; border-radius:8px; }
+            QPlainTextEdit#DebugTerminal { background:#1c2529; color:#a8c8d0; border:none;
+                                           padding:6px; selection-background-color:#2a4a54; }
+            QLabel#Title   { color:#c8e8f0; font-size:24px; font-weight:800; }
+            QLabel#Subtitle{ color:#6a8a94; font-size:13px; }
         """)
 
         title = QLabel("STAR Analyzer")
@@ -121,17 +108,20 @@ class MainWindow(QMainWindow):
 
         status_frame = QFrame()
         status_frame.setObjectName("StatusCard")
-        self.screen = QLabel("Ready.\nSelect a video to begin.")
-        self.screen.setObjectName("Status")
-        self.screen.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.screen.setWordWrap(True)
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(500)
+        _f = QFont("Consolas"); _f.setStyleHint(QFont.Monospace); _f.setPointSize(10)
+        self._log.setFont(_f)
+        self._log.setObjectName("DebugTerminal")
 
         status_layout = QVBoxLayout(status_frame)
         status_layout.setContentsMargins(18, 18, 18, 18)
         status_layout.addWidget(title)
         status_layout.addWidget(subtitle)
         status_layout.addSpacing(12)
-        status_layout.addWidget(self.screen, stretch=1)
+        status_layout.addWidget(self._log, stretch=1)
+        self.log("STAR Analyzer ready. Select a video to begin.")
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(status_frame, stretch=1)
@@ -145,6 +135,21 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(outer_layout)
         self.setCentralWidget(container)
+
+    def log(self, message: str, level: str = 'info') -> None:
+        COLORS = {'info': '#a8c8d0', 'ok': '#43d692', 'warn': '#fad165', 'error': '#e66550'}
+        TAGS   = {'info': 'INFO', 'ok': 'OK  ', 'warn': 'WARN', 'error': 'ERR '}
+        color  = COLORS.get(level, COLORS['info'])
+        tag    = TAGS.get(level,   TAGS['info'])
+        ts     = QDateTime.currentDateTime().toString("hh:mm:ss")
+        esc    = (message.replace("&", "&amp;").replace("<", "&lt;")
+                         .replace(">", "&gt;").replace("\n", "<br>"))
+        self._log.appendHtml(
+            f'<span style="color:#4a6a74">[{ts}]</span> '
+            f'<span style="color:{color}">[{tag}] {esc}</span>'
+        )
+        sb = self._log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def select_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -160,16 +165,12 @@ class MainWindow(QMainWindow):
             self.video_info = self._validate_video(path)
             self.video_path = path
             info = self.video_info
-            self.screen.setText(
-                f"Video loaded: {path.split('/')[-1]}\n"
-                f"Resolution: {info['width']} x {info['height']}\n"
-                f"Frames: {info['frames']} | FPS: {info['fps']:.2f}\n"
-                "Status: video validation passed."
-            )
+            self.log(path.split('/')[-1], 'ok')
+            self.log(f"{info['width']} x {info['height']}  |  {info['frames']} frames  |  {info['fps']:.2f} fps", 'info')
         except Exception as exc:
             self.video_path = None
             self.video_info = None
-            self.screen.setText(f"Video validation failed:\n{exc}")
+            self.log(f"Video validation failed: {exc}", 'error')
 
     def select_h5(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -184,20 +185,16 @@ class MainWindow(QMainWindow):
         try:
             self.sleap_data = load_sleap(path)
             d = self.sleap_data
-            self.screen.setText(
-                f"H5 loaded: {path.split('/')[-1]}\n"
-                f"Tracks: {len(d['track_names'])} | Nodes: {len(d['node_names'])}\n"
-                f"Tracked frames: {len(d['frame_map'])}\n"
-                f"Missing coordinate values: {d['nan_count']}\n"
-                "Status: SLEAP validation passed."
-            )
+            self.log(path.split('/')[-1], 'ok')
+            self.log(f"Tracks: {len(d['track_names'])}  |  Nodes: {len(d['node_names'])}  |  Tracked frames: {len(d['frame_map'])}", 'info')
+            self.log(f"Missing coordinate values: {d['nan_count']}", 'info')
         except Exception as exc:
             self.sleap_data = None
-            self.screen.setText(f"Failed to load H5:\n{exc}")
+            self.log(f"Failed to load SLEAP file: {exc}", 'error')
 
     def open_run_popup(self):
         if not self.video_path:
-            self.screen.setText("Select and validate a video first.")
+            self.log("Select and validate a video first.", 'warn')
             return
         self._popup = RunPopUp(self.video_path, sleap_data=self.sleap_data)
         self._popup.roi_selected.connect(self._on_roi_selected)
@@ -205,10 +202,10 @@ class MainWindow(QMainWindow):
     def _on_roi_selected(self, roi):
         self.roi = roi
         if roi:
-            (x0, y0), (x1, y1) = roi
-            self.screen.setText(f"ROI selected: ({x0}, {y0}) -> ({x1}, {y1})")
+            (x0, y0), (x1, y1), side = roi
+            self.log(f"ROI confirmed: TL ({x0},{y0})  BR ({x1},{y1})  W {side}px", 'ok')
         else:
-            self.screen.setText("No ROI drawn.")
+            self.log("ROI cleared — no region defined.", 'warn')
 
     @staticmethod
     def _validate_video(path):
