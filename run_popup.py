@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QTimer, QDateTime
+from PySide6.QtCore import Qt, Signal, QTimer, QDateTime, QThread, QObject
 import pandas as pd
 from PySide6.QtWidgets import (
     QWidget,
@@ -14,10 +14,34 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QFileDialog,
     QMessageBox,
+    QProgressBar,
 )
 from PySide6.QtCore import QRectF
-
+from preprocessing import fill_and_smooth_tracks, compute_kinematics
 from roi_view import ROIView
+
+
+class _ProcessWorker(QObject):
+    progress = Signal(int)    # 0-100
+    finished = Signal(object) # the completed processed_data dict
+    error    = Signal(str)
+
+    def __init__(self, sleap_data, fps):
+        super().__init__()
+        self._sleap_data = sleap_data
+        self._fps = fps
+
+    def run(self):
+        try:
+            processed = dict(self._sleap_data)
+            processed["tracks"] = fill_and_smooth_tracks(
+                self._sleap_data["tracks"],
+                fps=self._fps,
+                progress_callback=self.progress.emit,
+            )
+            self.finished.emit(processed)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 def _classify_zone(x, y, rx0, ry0, rx1, ry1, strip):
@@ -96,9 +120,9 @@ class RunPopUp(QWidget):
         self._cap        = cv2.VideoCapture(video_path)
         self._n_frames   = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
         self._index      = 0
-        self._sleap_data = sleap_data
-
         self._fps             = float(self._cap.get(cv2.CAP_PROP_FPS) or 30)
+        self._sleap_data = sleap_data
+        self._processed_sleap_data = None
         self._timer           = QTimer(self)
         self._timer.setInterval(min(1000, max(1, int(1000 / self._fps))))
         self._timer.timeout.connect(self._advance_frame)
@@ -210,9 +234,24 @@ class RunPopUp(QWidget):
         self._btn_confirm = QPushButton("Confirm")
         for btn in (self._btn_clear, self._btn_confirm):
             controls_row.addWidget(btn)
-        self._btn_export = QPushButton("Analyze && Export")
+        self._btn_process = QPushButton("Process")
+        self._btn_export  = QPushButton("Export")
+        controls_row.addWidget(self._btn_process)
         controls_row.addWidget(self._btn_export)
         main.addLayout(controls_row)
+
+        # Progress bar (hidden until processing starts)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setFixedHeight(6)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background:#222; border:none; border-radius:3px; }"
+            "QProgressBar::chunk { background:#00c8e0; border-radius:3px; }"
+        )
+        main.addWidget(self._progress_bar)
 
         # ROI info frame
         self._roi_info_frame = QFrame()
@@ -237,9 +276,13 @@ class RunPopUp(QWidget):
         self._btn_confirm.clicked.connect(self._confirm_roi)
         self._spin_arena_cm.valueChanged.connect(self._on_arena_cm_changed)
         self._spin_strip_cm.valueChanged.connect(self._on_arena_cm_changed)
+        self._btn_process.clicked.connect(self._run_process)
         self._btn_export.clicked.connect(self._run_export)
         self.view.roi_changed.connect(self._on_roi_changed)
         self.view_b.roi_changed.connect(self._on_roi_changed)
+
+        self._worker = None
+        self._proc_thread = None
 
         self.setWindowTitle("ROI Selector")
         self.resize(1440, 620)
@@ -250,45 +293,53 @@ class RunPopUp(QWidget):
         index = max(0, min(index, self._n_frames - 1))
         self._cap.set(cv2.CAP_PROP_POS_FRAMES, index)
         ok, frame = self._cap.read()
+
         if ok:
             self._index = index
+
+            frame_orig = frame.copy()
+            frame_post = frame.copy()
+
             if self._sleap_data is not None:
-                frame = self._draw_sleap(frame.copy(), index)
+                frame_orig = self._draw_sleap(frame_orig, index, self._sleap_data)
+
+            if self._processed_sleap_data is not None:
+                frame_post = self._draw_sleap(frame_post, index, self._processed_sleap_data)
+
             if self._zones:
-                frame = self._draw_zones(frame)
-            self.view.set_frame(frame)
-            self.view_b.set_frame(frame)
+                frame_orig = self._draw_zones(frame_orig)
+                frame_post = self._draw_zones(frame_post)
+
+            self.view.set_frame(frame_orig)
+            self.view_b.set_frame(frame_post)
+
             if not self._slider_dragging:
                 self._slider.setValue(self._index)
+
             self._frame_label.setText(f"{self._index:04d} / {self._n_frames - 1:04d}")
 
     # ---- SLEAP skeleton overlay ----------------------------------------
 
-    def _draw_sleap(self, frame, video_frame_idx):
-        """Draw skeleton edges and keypoint nodes for the given video frame."""
-        frame_map = self._sleap_data["frame_map"]
+    def _draw_sleap(self, frame, video_frame_idx, sleap_data):
+        frame_map = sleap_data["frame_map"]
         if video_frame_idx not in frame_map:
             return frame
 
         sleap_idx = frame_map[video_frame_idx]
-        tracks    = self._sleap_data["tracks"]    # (n_frames, 2, n_nodes, n_tracks)
-        edge_inds = self._sleap_data["edge_inds"] # (n_edges, 2)
-        n_tracks  = tracks.shape[3]
+        tracks = sleap_data["tracks"]
+        edge_inds = sleap_data["edge_inds"]
+        n_tracks = tracks.shape[3]
 
         for t in range(n_tracks):
             color = self._TRACK_COLORS[t % len(self._TRACK_COLORS)]
-            pts   = tracks[sleap_idx, :, :, t]   # (2, n_nodes) — row0=x, row1=y
+            pts = tracks[sleap_idx, :, :, t]
 
-            # Skeleton edges
             for src, dst in edge_inds:
                 x0, y0 = pts[0, src], pts[1, src]
                 x1, y1 = pts[0, dst], pts[1, dst]
                 if not any(np.isnan([x0, y0, x1, y1])):
-                    cv2.line(frame,
-                             (int(x0), int(y0)), (int(x1), int(y1)),
-                             color, 2, cv2.LINE_AA)
+                    cv2.line(frame, (int(x0), int(y0)), (int(x1), int(y1)), color, 2, cv2.LINE_AA)
 
-            # Keypoint nodes
             for n in range(pts.shape[1]):
                 x, y = pts[0, n], pts[1, n]
                 if not (np.isnan(x) or np.isnan(y)):
@@ -390,14 +441,54 @@ class RunPopUp(QWidget):
         self._recompute_zones()
         self._show_frame(self._index)
 
+    # ---- Process -------------------------------------------------------
+
+    def _run_process(self):
+        if self._sleap_data is None:
+            QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first.")
+            return
+
+        self._btn_process.setEnabled(False)
+        self._btn_process.setText("Processing…")
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+
+        self._worker = _ProcessWorker(self._sleap_data, self._fps)
+        self._proc_thread = QThread()
+        self._worker.moveToThread(self._proc_thread)
+
+        self._proc_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._progress_bar.setValue)
+        self._worker.finished.connect(self._on_process_done)
+        self._worker.error.connect(self._on_process_error)
+        self._worker.finished.connect(self._proc_thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._proc_thread.finished.connect(self._proc_thread.deleteLater)
+
+        self._proc_thread.start()
+
+    def _on_process_done(self, processed_data):
+        self._processed_sleap_data = processed_data
+        self._btn_process.setEnabled(True)
+        self._btn_process.setText("Process")
+        self._progress_bar.setVisible(False)
+        self._show_frame(self._index)
+
+    def _on_process_error(self, msg):
+        self._btn_process.setEnabled(True)
+        self._btn_process.setText("Process")
+        self._progress_bar.setVisible(False)
+        QMessageBox.critical(self, "Process failed", msg)
+
     # ---- Export --------------------------------------------------------
 
     def _run_export(self):
+        if self._processed_sleap_data is None:
+            QMessageBox.warning(self, "Not processed", "Run 'Process' first.")
+            return
         roi = self.view.roi_native()
         if roi is None:
             QMessageBox.warning(self, "No ROI", "Draw an ROI first."); return
-        if self._sleap_data is None:
-            QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first."); return
 
         (rx0, ry0), (rx1, ry1), side = roi
         arena_cm  = self._spin_arena_cm.value()
@@ -405,10 +496,16 @@ class RunPopUp(QWidget):
         px_per_cm = side / arena_cm
         strip     = strip_cm * px_per_cm
 
-        tracks      = self._sleap_data["tracks"]       # (n_frames, 2, n_nodes, n_tracks)
-        frame_map   = self._sleap_data["frame_map"]    # video_frame → sleap_idx
-        node_names  = self._sleap_data["node_names"]
-        track_names = self._sleap_data["track_names"]
+        source_data = self._processed_sleap_data
+        tracks = source_data["tracks"]
+        frame_map = source_data["frame_map"]
+        node_names = source_data["node_names"]
+        track_names = source_data["track_names"]
+
+        kin = compute_kinematics(tracks, self._fps)
+        inv_ppcm  = 1.0 / px_per_cm
+        inv_ppcm2 = inv_ppcm ** 2
+        inv_ppcm3 = inv_ppcm ** 3
 
         # ---- Build main data table ----
         rows = []
@@ -426,15 +523,21 @@ class RunPopUp(QWidget):
                         x_cm  = round((x - rx0) / px_per_cm, 3)
                         y_cm  = round((y - ry0) / px_per_cm, 3)
                     rows.append({
-                        "Frame":       vid_frame,
-                        "Time (s)":    time_s,
-                        "Track":       track_names[t],
-                        "Body Part":   node,
-                        "X (px)":      round(x, 2) if not np.isnan(x) else float("nan"),
-                        "Y (px)":      round(y, 2) if not np.isnan(y) else float("nan"),
-                        "X (cm)":      x_cm,
-                        "Y (cm)":      y_cm,
-                        "Zone":        zone,
+                        "Frame":          vid_frame,
+                        "Time (s)":       time_s,
+                        "Track":          track_names[t],
+                        "Body Part":      node,
+                        "X (px)":         round(x, 2) if not np.isnan(x) else float("nan"),
+                        "Y (px)":         round(y, 2) if not np.isnan(y) else float("nan"),
+                        "X (cm)":         x_cm,
+                        "Y (cm)":         y_cm,
+                        "Zone":           zone,
+                        "Vx (cm/s)":      round(float(kin["vx"][sleap_idx, n, t])    * inv_ppcm,  3),
+                        "Vy (cm/s)":      round(float(kin["vy"][sleap_idx, n, t])    * inv_ppcm,  3),
+                        "Speed (cm/s)":   round(float(kin["speed"][sleap_idx, n, t]) * inv_ppcm,  3),
+                        "Heading (deg)":  round(float(kin["heading_deg"][sleap_idx, n, t]),        2),
+                        "Accel (cm/s²)":  round(float(kin["accel"][sleap_idx, n, t]) * inv_ppcm2, 3),
+                        "Jerk (cm/s³)":   round(float(kin["jerk"][sleap_idx, n, t])  * inv_ppcm3, 3),
                     })
 
         df = pd.DataFrame(rows)

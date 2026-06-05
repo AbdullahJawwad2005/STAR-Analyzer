@@ -2,3 +2,7 @@ PySide6
 opencv-python
 numpy
 h5py
+pandas
+openpyxl
+scipy
+pykalman
