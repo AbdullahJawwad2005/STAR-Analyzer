@@ -33,7 +33,7 @@ def _classify_zone(x, y, rx0, ry0, rx1, ry1, strip):
     if right:  return "W2"
     if bottom: return "W3"
     if left:   return "W4"
-    return "CENTER"
+    return "Open"
 
 
 class RunPopUp(QWidget):
@@ -65,7 +65,7 @@ class RunPopUp(QWidget):
         "C3": (0, 140, 255), "C4": (0, 140, 255),
         "W1": (40, 200, 40), "W2": (40, 200, 40),
         "W3": (40, 200, 40), "W4": (40, 200, 40),
-        "CENTER": (200, 100, 200),
+        "Open": (200, 100, 200),
     }
 
     def __init__(self, video_path, sleap_data=None):
@@ -163,17 +163,30 @@ class RunPopUp(QWidget):
             controls_row.addWidget(btn)
         controls_row.addStretch()
         controls_row.addWidget(QLabel("Width:"))
-        self._spin_width = QSpinBox()
-        self._spin_width.setRange(1, 9999)
-        self._spin_width.setValue(200)
-        self._spin_width.setFixedWidth(70)
-        controls_row.addWidget(self._spin_width)
+        self._lbl_width = QLabel("—")
+        self._lbl_width.setMinimumWidth(60)
+        self._lbl_width.setStyleSheet(
+            "color:#00d4f0; font:12px 'Consolas','Courier New',monospace;"
+            "background:#222; border:1px solid #383838; border-radius:3px; padding:3px 6px;"
+        )
+        controls_row.addWidget(self._lbl_width)
         controls_row.addSpacing(8)
-        controls_row.addWidget(QLabel("Arena cm:"))
+        controls_row.addWidget(QLabel("Arena size (cm):"))
         self._spin_arena_cm = QSpinBox()
-        self._spin_arena_cm.setRange(1, 999)
+        self._spin_arena_cm.setRange(1, 9999)
         self._spin_arena_cm.setValue(40)
-        self._spin_arena_cm.setFixedWidth(60)
+        self._spin_arena_cm.setMinimumWidth(85)
+        self._spin_arena_cm.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self._spin_arena_cm.setStyleSheet(
+            "QSpinBox { background:#2d2d2d; color:#f0f0f0; border:1px solid #666;"
+            "           border-radius:3px; padding:4px 22px 4px 8px; font-size:13px; }"
+            "QSpinBox::up-button   { width:20px; border-left:1px solid #555; background:#383838; }"
+            "QSpinBox::down-button { width:20px; border-left:1px solid #555; background:#383838; }"
+            "QSpinBox::up-button:hover   { background:#4a4a4a; }"
+            "QSpinBox::down-button:hover { background:#4a4a4a; }"
+            "QSpinBox::up-arrow   { width:8px; height:8px; }"
+            "QSpinBox::down-arrow { width:8px; height:8px; }"
+        )
         controls_row.addWidget(self._spin_arena_cm)
         self._btn_clear   = QPushButton("Clear")
         self._btn_confirm = QPushButton("Confirm")
@@ -297,7 +310,7 @@ class RunPopUp(QWidget):
         x1, y1 = int(round(rect.right())), int(round(rect.bottom()))
         self._lbl_tl.setText(f"TL:  ({x0}, {y0})")
         self._lbl_br.setText(f"BR:  ({x1}, {y1})")
-        self._spin_width.setValue(x1 - x0)
+        self._lbl_width.setText(f"{x1 - x0} px")
         self._recompute_zones()
         self._show_frame(self._index)
 
@@ -306,6 +319,9 @@ class RunPopUp(QWidget):
         self.view_b.clear_roi()
         self._lbl_tl.setText("TL:  —")
         self._lbl_br.setText("BR:  —")
+        self._lbl_width.setText("—")
+        self._zones = None
+        self._show_frame(self._index)
 
     def _confirm_roi(self):
         self.roi_selected.emit(self.view.roi_native())
@@ -332,7 +348,7 @@ class RunPopUp(QWidget):
             "W2":     (rx1-s,   ry0+s,   rx1,    ry1-s),
             "W3":     (rx0+s,   ry1-s,   rx1-s,  ry1  ),
             "W4":     (rx0,     ry0+s,   rx0+s,  ry1-s),
-            "CENTER": (rx0+s,   ry0+s,   rx1-s,  ry1-s),
+            "Open":   (rx0+s,   ry0+s,   rx1-s,  ry1-s),
         }
 
     def _draw_zones(self, frame):
@@ -365,34 +381,94 @@ class RunPopUp(QWidget):
             QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first."); return
 
         (rx0, ry0), (rx1, ry1), side = roi
-        strip = 8 * (side / self._spin_arena_cm.value())
+        arena_cm = self._spin_arena_cm.value()
+        strip    = 8 * (side / arena_cm)
+        px_per_cm = side / arena_cm
 
         tracks      = self._sleap_data["tracks"]       # (n_frames, 2, n_nodes, n_tracks)
         frame_map   = self._sleap_data["frame_map"]    # video_frame → sleap_idx
         node_names  = self._sleap_data["node_names"]
         track_names = self._sleap_data["track_names"]
 
+        # ---- Build main data table ----
         rows = []
-        for vid_frame, sleap_idx in frame_map.items():
+        for vid_frame, sleap_idx in sorted(frame_map.items()):
+            time_s = round(vid_frame / self._fps, 4)
             for t in range(tracks.shape[3]):
                 pts = tracks[sleap_idx, :, :, t]       # (2, n_nodes)
                 for n, node in enumerate(node_names):
                     x, y = float(pts[0, n]), float(pts[1, n])
-                    zone = ("NaN" if (np.isnan(x) or np.isnan(y))
-                            else _classify_zone(x, y, rx0, ry0, rx1, ry1, strip))
-                    rows.append({"frame": vid_frame, "track": track_names[t],
-                                 "node": node, "x_px": round(x, 2), "y_px": round(y, 2),
-                                 "zone": zone})
+                    if np.isnan(x) or np.isnan(y):
+                        zone = "Undetected"
+                        x_cm = y_cm = float("nan")
+                    else:
+                        zone  = _classify_zone(x, y, rx0, ry0, rx1, ry1, strip)
+                        x_cm  = round((x - rx0) / px_per_cm, 3)
+                        y_cm  = round((y - ry0) / px_per_cm, 3)
+                    rows.append({
+                        "Frame":       vid_frame,
+                        "Time (s)":    time_s,
+                        "Track":       track_names[t],
+                        "Body Part":   node,
+                        "X (px)":      round(x, 2) if not np.isnan(x) else float("nan"),
+                        "Y (px)":      round(y, 2) if not np.isnan(y) else float("nan"),
+                        "X (cm)":      x_cm,
+                        "Y (cm)":      y_cm,
+                        "Zone":        zone,
+                    })
+
+        df = pd.DataFrame(rows)
 
         path, _ = QFileDialog.getSaveFileName(
             self, "Save zone analysis", "", "Excel (*.xlsx);;CSV (*.csv)")
         if not path:
             return
-        df = pd.DataFrame(rows)
+
         if path.endswith(".csv"):
             df.to_csv(path, index=False)
         else:
-            df.to_excel(path, index=False)
+            # ---- Zone summary (unique frames per track/zone, NaN/Undetected excluded) ----
+            detected = df[df["Zone"] != "Undetected"]
+            summary = (
+                detected.drop_duplicates(subset=["Frame", "Track", "Zone"])
+                .groupby(["Track", "Zone"], sort=False)
+                .size()
+                .reset_index(name="Frame Count")
+            )
+            total_frames = len(frame_map)
+            summary["Time in Zone (s)"] = (summary["Frame Count"] / self._fps).round(2)
+            summary["% of Session"]     = (100 * summary["Frame Count"] / total_frames).round(1)
+            # Sort zones in a logical order
+            zone_order = ["C1","C2","C3","C4","W1","W2","W3","W4","Open"]
+            summary["_z"] = summary["Zone"].map({z: i for i, z in enumerate(zone_order)}).fillna(99)
+            summary = summary.sort_values(["Track", "_z"]).drop(columns="_z").reset_index(drop=True)
+
+            # ---- Session info ----
+            info_rows = [
+                ("Export date",         QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")),
+                ("", ""),
+                ("--- ROI & Calibration ---", ""),
+                ("ROI top-left (px)",    f"({rx0}, {ry0})"),
+                ("ROI bottom-right (px)",f"({rx1}, {ry1})"),
+                ("ROI width (px)",       side),
+                ("Arena size (cm)",      arena_cm),
+                ("Scale (px/cm)",        round(px_per_cm, 4)),
+                ("Zone border strip",    "8 cm"),
+                ("", ""),
+                ("--- Session Stats ---", ""),
+                ("Total tracked frames", total_frames),
+                ("Video FPS",            round(self._fps, 4)),
+                ("Tracks",               ", ".join(track_names)),
+                ("Body parts",           ", ".join(node_names)),
+                ("Total data rows",      len(df)),
+            ]
+            info_df = pd.DataFrame(info_rows, columns=["Parameter", "Value"])
+
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                df.to_excel(writer,      sheet_name="Tracking Data", index=False)
+                summary.to_excel(writer, sheet_name="Zone Summary",  index=False)
+                info_df.to_excel(writer, sheet_name="Session Info",  index=False)
+
         QMessageBox.information(self, "Done", f"Exported {len(rows):,} rows to:\n{path}")
 
     def closeEvent(self, event):
