@@ -188,6 +188,24 @@ class RunPopUp(QWidget):
             "QSpinBox::down-arrow { width:8px; height:8px; }"
         )
         controls_row.addWidget(self._spin_arena_cm)
+        controls_row.addSpacing(8)
+        controls_row.addWidget(QLabel("Border (cm):"))
+        self._spin_strip_cm = QSpinBox()
+        self._spin_strip_cm.setRange(1, 999)
+        self._spin_strip_cm.setValue(8)
+        self._spin_strip_cm.setMinimumWidth(85)
+        self._spin_strip_cm.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self._spin_strip_cm.setStyleSheet(
+            "QSpinBox { background:#2d2d2d; color:#f0f0f0; border:1px solid #666;"
+            "           border-radius:3px; padding:4px 22px 4px 8px; font-size:13px; }"
+            "QSpinBox::up-button   { width:20px; border-left:1px solid #555; background:#383838; }"
+            "QSpinBox::down-button { width:20px; border-left:1px solid #555; background:#383838; }"
+            "QSpinBox::up-button:hover   { background:#4a4a4a; }"
+            "QSpinBox::down-button:hover { background:#4a4a4a; }"
+            "QSpinBox::up-arrow   { width:8px; height:8px; }"
+            "QSpinBox::down-arrow { width:8px; height:8px; }"
+        )
+        controls_row.addWidget(self._spin_strip_cm)
         self._btn_clear   = QPushButton("Clear")
         self._btn_confirm = QPushButton("Confirm")
         for btn in (self._btn_clear, self._btn_confirm):
@@ -218,6 +236,7 @@ class RunPopUp(QWidget):
         self._btn_clear.clicked.connect(self._clear_roi_and_labels)
         self._btn_confirm.clicked.connect(self._confirm_roi)
         self._spin_arena_cm.valueChanged.connect(self._on_arena_cm_changed)
+        self._spin_strip_cm.valueChanged.connect(self._on_arena_cm_changed)
         self._btn_export.clicked.connect(self._run_export)
         self.view.roi_changed.connect(self._on_roi_changed)
         self.view_b.roi_changed.connect(self._on_roi_changed)
@@ -338,7 +357,7 @@ class RunPopUp(QWidget):
         if cm <= 0 or side <= 0:
             self._zones = None; return
         self._px_per_cm = side / cm
-        s = int(round(8 * self._px_per_cm))   # 8 cm strip in pixels
+        s = int(round(self._spin_strip_cm.value() * self._px_per_cm))
         self._zones = {
             "C1":     (rx0,     ry0,     rx0+s,  ry0+s),
             "C2":     (rx1-s,   ry0,     rx1,    ry0+s),
@@ -381,9 +400,10 @@ class RunPopUp(QWidget):
             QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first."); return
 
         (rx0, ry0), (rx1, ry1), side = roi
-        arena_cm = self._spin_arena_cm.value()
-        strip    = 8 * (side / arena_cm)
+        arena_cm  = self._spin_arena_cm.value()
+        strip_cm  = self._spin_strip_cm.value()
         px_per_cm = side / arena_cm
+        strip     = strip_cm * px_per_cm
 
         tracks      = self._sleap_data["tracks"]       # (n_frames, 2, n_nodes, n_tracks)
         frame_map   = self._sleap_data["frame_map"]    # video_frame → sleap_idx
@@ -453,7 +473,7 @@ class RunPopUp(QWidget):
                 ("ROI width (px)",       side),
                 ("Arena size (cm)",      arena_cm),
                 ("Scale (px/cm)",        round(px_per_cm, 4)),
-                ("Zone border strip",    "8 cm"),
+                ("Zone border strip (cm)", strip_cm),
                 ("", ""),
                 ("--- Session Stats ---", ""),
                 ("Total tracked frames", total_frames),
