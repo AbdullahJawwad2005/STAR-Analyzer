@@ -26,9 +26,17 @@ def load_sleap(path):
 
     if tracks.ndim != 4 or tracks.shape[1] != 2:
         raise ValueError(
-            "Expected tracks shape (n_frames, 2, n_nodes, n_tracks); "
+            "Expected tracks shape (n_frames, 2, n_nodes, n_tracks) or "
+            "(n_tracks, 2, n_nodes, n_frames); "
             f"got {tracks.shape}."
         )
+
+    # Detect (n_tracks, 2, n_nodes, n_frames) layout and transpose to
+    # (n_frames, 2, n_nodes, n_tracks).
+    if len(track_names) == tracks.shape[0] and len(node_names) == tracks.shape[2]:
+        tracks = tracks.transpose(3, 1, 2, 0)
+        frame_idx = np.arange(tracks.shape[0])
+
     if len(node_names) != tracks.shape[2]:
         raise ValueError("Node name count does not match tracks node dimension.")
     if len(track_names) != tracks.shape[3]:

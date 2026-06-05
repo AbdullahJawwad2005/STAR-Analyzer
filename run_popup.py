@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QTimer, QDateTime
+import pandas as pd
 from PySide6.QtWidgets import (
     QWidget,
     QPushButton,
@@ -11,10 +12,28 @@ from PySide6.QtWidgets import (
     QSlider,
     QLabel,
     QSpinBox,
+    QFileDialog,
+    QMessageBox,
 )
 from PySide6.QtCore import QRectF
 
 from roi_view import ROIView
+
+
+def _classify_zone(x, y, rx0, ry0, rx1, ry1, strip):
+    left   = x < rx0 + strip
+    right  = x > rx1 - strip
+    top    = y < ry0 + strip
+    bottom = y > ry1 - strip
+    if left  and top:     return "C1"
+    if right and top:     return "C2"
+    if right and bottom:  return "C3"
+    if left  and bottom:  return "C4"
+    if top:    return "W1"
+    if right:  return "W2"
+    if bottom: return "W3"
+    if left:   return "W4"
+    return "CENTER"
 
 
 class RunPopUp(QWidget):
@@ -40,6 +59,14 @@ class RunPopUp(QWidget):
         (220,  80, 220),  # magenta
         (220, 220,  80),  # cyan
     ]
+
+    _ZONE_COLORS = {
+        "C1": (0, 140, 255), "C2": (0, 140, 255),
+        "C3": (0, 140, 255), "C4": (0, 140, 255),
+        "W1": (40, 200, 40), "W2": (40, 200, 40),
+        "W3": (40, 200, 40), "W4": (40, 200, 40),
+        "CENTER": (200, 100, 200),
+    }
 
     def __init__(self, video_path, sleap_data=None):
         super().__init__()
@@ -76,6 +103,8 @@ class RunPopUp(QWidget):
         self._timer.setInterval(min(1000, max(1, int(1000 / self._fps))))
         self._timer.timeout.connect(self._advance_frame)
         self._slider_dragging = False
+        self._zones     = None   # dict zone_name → (x0,y0,x1,y1) native px, or None
+        self._px_per_cm = None   # float, computed when ROI + cm spinbox are both valid
 
         self._build_ui()
         self._show_frame(0)
@@ -139,10 +168,19 @@ class RunPopUp(QWidget):
         self._spin_width.setValue(200)
         self._spin_width.setFixedWidth(70)
         controls_row.addWidget(self._spin_width)
+        controls_row.addSpacing(8)
+        controls_row.addWidget(QLabel("Arena cm:"))
+        self._spin_arena_cm = QSpinBox()
+        self._spin_arena_cm.setRange(1, 999)
+        self._spin_arena_cm.setValue(40)
+        self._spin_arena_cm.setFixedWidth(60)
+        controls_row.addWidget(self._spin_arena_cm)
         self._btn_clear   = QPushButton("Clear")
         self._btn_confirm = QPushButton("Confirm")
         for btn in (self._btn_clear, self._btn_confirm):
             controls_row.addWidget(btn)
+        self._btn_export = QPushButton("Analyze && Export")
+        controls_row.addWidget(self._btn_export)
         main.addLayout(controls_row)
 
         # ROI info frame
@@ -166,6 +204,8 @@ class RunPopUp(QWidget):
         self._btn_next.clicked.connect(lambda: self._show_frame(self._index + 1))
         self._btn_clear.clicked.connect(self._clear_roi_and_labels)
         self._btn_confirm.clicked.connect(self._confirm_roi)
+        self._spin_arena_cm.valueChanged.connect(self._on_arena_cm_changed)
+        self._btn_export.clicked.connect(self._run_export)
         self.view.roi_changed.connect(self._on_roi_changed)
         self.view_b.roi_changed.connect(self._on_roi_changed)
 
@@ -182,6 +222,8 @@ class RunPopUp(QWidget):
             self._index = index
             if self._sleap_data is not None:
                 frame = self._draw_sleap(frame.copy(), index)
+            if self._zones:
+                frame = self._draw_zones(frame)
             self.view.set_frame(frame)
             self.view_b.set_frame(frame)
             if not self._slider_dragging:
@@ -256,6 +298,8 @@ class RunPopUp(QWidget):
         self._lbl_tl.setText(f"TL:  ({x0}, {y0})")
         self._lbl_br.setText(f"BR:  ({x1}, {y1})")
         self._spin_width.setValue(x1 - x0)
+        self._recompute_zones()
+        self._show_frame(self._index)
 
     def _clear_roi_and_labels(self):
         self.view.clear_roi()
@@ -266,6 +310,90 @@ class RunPopUp(QWidget):
     def _confirm_roi(self):
         self.roi_selected.emit(self.view.roi_native())
         self.close()
+
+    # ---- Zone computation & drawing ------------------------------------
+
+    def _recompute_zones(self):
+        roi = self.view.roi_native()
+        if roi is None:
+            self._zones = None; self._px_per_cm = None; return
+        (rx0, ry0), (rx1, ry1), side = roi
+        cm = self._spin_arena_cm.value()
+        if cm <= 0 or side <= 0:
+            self._zones = None; return
+        self._px_per_cm = side / cm
+        s = int(round(8 * self._px_per_cm))   # 8 cm strip in pixels
+        self._zones = {
+            "C1":     (rx0,     ry0,     rx0+s,  ry0+s),
+            "C2":     (rx1-s,   ry0,     rx1,    ry0+s),
+            "C3":     (rx1-s,   ry1-s,   rx1,    ry1  ),
+            "C4":     (rx0,     ry1-s,   rx0+s,  ry1  ),
+            "W1":     (rx0+s,   ry0,     rx1-s,  ry0+s),
+            "W2":     (rx1-s,   ry0+s,   rx1,    ry1-s),
+            "W3":     (rx0+s,   ry1-s,   rx1-s,  ry1  ),
+            "W4":     (rx0,     ry0+s,   rx0+s,  ry1-s),
+            "CENTER": (rx0+s,   ry0+s,   rx1-s,  ry1-s),
+        }
+
+    def _draw_zones(self, frame):
+        if not self._zones:
+            return frame
+        overlay = frame.copy()
+        for name, (zx0, zy0, zx1, zy1) in self._zones.items():
+            cv2.rectangle(overlay, (zx0, zy0), (zx1, zy1), self._ZONE_COLORS[name], -1)
+        cv2.addWeighted(overlay, 0.22, frame, 0.78, 0, frame)
+        for name, (zx0, zy0, zx1, zy1) in self._zones.items():
+            color = self._ZONE_COLORS[name]
+            cv2.rectangle(frame, (zx0, zy0), (zx1, zy1), color, 1)
+            cx, cy = (zx0 + zx1) // 2, (zy0 + zy1) // 2
+            (tw, th), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.putText(frame, name, (cx - tw // 2, cy + th // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        return frame
+
+    def _on_arena_cm_changed(self, _):
+        self._recompute_zones()
+        self._show_frame(self._index)
+
+    # ---- Export --------------------------------------------------------
+
+    def _run_export(self):
+        roi = self.view.roi_native()
+        if roi is None:
+            QMessageBox.warning(self, "No ROI", "Draw an ROI first."); return
+        if self._sleap_data is None:
+            QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first."); return
+
+        (rx0, ry0), (rx1, ry1), side = roi
+        strip = 8 * (side / self._spin_arena_cm.value())
+
+        tracks      = self._sleap_data["tracks"]       # (n_frames, 2, n_nodes, n_tracks)
+        frame_map   = self._sleap_data["frame_map"]    # video_frame → sleap_idx
+        node_names  = self._sleap_data["node_names"]
+        track_names = self._sleap_data["track_names"]
+
+        rows = []
+        for vid_frame, sleap_idx in frame_map.items():
+            for t in range(tracks.shape[3]):
+                pts = tracks[sleap_idx, :, :, t]       # (2, n_nodes)
+                for n, node in enumerate(node_names):
+                    x, y = float(pts[0, n]), float(pts[1, n])
+                    zone = ("NaN" if (np.isnan(x) or np.isnan(y))
+                            else _classify_zone(x, y, rx0, ry0, rx1, ry1, strip))
+                    rows.append({"frame": vid_frame, "track": track_names[t],
+                                 "node": node, "x_px": round(x, 2), "y_px": round(y, 2),
+                                 "zone": zone})
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save zone analysis", "", "Excel (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        df = pd.DataFrame(rows)
+        if path.endswith(".csv"):
+            df.to_csv(path, index=False)
+        else:
+            df.to_excel(path, index=False)
+        QMessageBox.information(self, "Done", f"Exported {len(rows):,} rows to:\n{path}")
 
     def closeEvent(self, event):
         self._timer.stop()

@@ -166,7 +166,12 @@ class MainWindow(QMainWindow):
             self.video_path = path
             info = self.video_info
             self.log(path.split('/')[-1], 'ok')
-            self.log(f"{info['width']} x {info['height']}  |  {info['frames']} frames  |  {info['fps']:.2f} fps", 'info')
+            dur = info['frames'] / info['fps'] if info['fps'] else 0
+            self.log(
+                f"{info['width']} x {info['height']}  |  {info['frames']} frames  |  "
+                f"{info['fps']:.2f} fps  |  {dur:.1f}s",
+                'info'
+            )
         except Exception as exc:
             self.video_path = None
             self.video_info = None
