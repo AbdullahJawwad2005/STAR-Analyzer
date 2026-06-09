@@ -32,7 +32,12 @@ def _kalman_fill_gap(trace, gap_start, gap_end, fps):
         observation_covariance=np.eye(1) * 1e-2,
         initial_state_mean=[float(finite_vals[0]), 0],
     )
-    smoothed_means, _ = kf.smooth(window)
+    # pykalman requires a masked array so it knows which observations are
+    # missing (NaN).  Passing a plain ndarray with NaN values causes the
+    # smoother to treat them as valid zero-ish observations and return
+    # all-NaN smoothed means, causing long gaps to fall through to the
+    # linear-interpolation fallback without ever using the Kalman smoother.
+    smoothed_means, _ = kf.smooth(np.ma.masked_invalid(window))
 
     for i in range(gap_start, gap_end + 1):
         if np.isnan(trace[i]):

@@ -520,7 +520,7 @@ def _mean_approach_angle_arr(tracks, kin, body_idx, tA, tB, f0, f1):
     yA  = tracks[f0:f1, 1, body_idx, tA].astype(np.float64)
     xB  = tracks[f0:f1, 0, body_idx, tB].astype(np.float64)
     yB  = tracks[f0:f1, 1, body_idx, tB].astype(np.float64)
-    ok  = np.isfinite(xA) & np.isfinite(xB) & np.isfinite(hdg)
+    ok  = np.isfinite(xA) & np.isfinite(yA) & np.isfinite(xB) & np.isfinite(yB) & np.isfinite(hdg)
     if not np.any(ok):
         return 90.0
     dir_AB = np.degrees(np.arctan2(yB[ok] - yA[ok], xB[ok] - xA[ok]))

@@ -468,6 +468,15 @@ def build_025s_bins(track_arrays: dict,
     bins     = _build_bin_map(frame_map, fps, bin_size_s)
     bin_fps  = 1.0 / bin_size_s          # effective fps at bin resolution (e.g. 4)
 
+    # Expected number of video frames per bin (e.g. 7-8 at 30 fps / 0.25 s).
+    # Used as the denominator for proportion columns instead of len(idx_arr)
+    # (which is only the *detected* frames in the bin).  For sparse frame_maps
+    # len(idx_arr) can be much smaller than the true window width, inflating
+    # proportions: 1 detected engaged frame out of 7 total would give 1.0
+    # instead of ~0.14.  Using the nominal bin width keeps proportions comparable
+    # across bins regardless of tracking coverage.
+    n_expected = max(1, round(fps * bin_size_s))
+
     # Ordered list for sequential processing; bin_list[i] = (bin_idx, [sleap_idxs])
     bin_list = list(bins.items())
     n_bins   = len(bin_list)
@@ -532,8 +541,7 @@ def build_025s_bins(track_arrays: dict,
             for bk in ('stationary', 'walking', 'running', 'turning', 'dir_reversal'):
                 if bk in single_beh:
                     vals = single_beh[bk][idx_arr, t].astype(np.float64)
-                    n_bin = len(vals)
-                    row[f'{bk}_prop'] = float(vals.sum() / n_bin) if n_bin > 0 else np.nan
+                    row[f'{bk}_prop'] = float(vals.sum() / n_expected)
 
             animal_rows.append(row)
 
@@ -548,7 +556,6 @@ def build_025s_bins(track_arrays: dict,
         for bin_idx, sleap_idxs in bin_list:
             bin_time = round(bin_idx * bin_size_s, 4)
             idx_arr  = np.array(sleap_idxs, dtype=int)
-            n_bin    = len(idx_arr)
 
             for pfx, (tA, tB, nA, nB) in pair_pfx_map.items():
                 if pfx not in pair_col_cats:
@@ -591,17 +598,17 @@ def build_025s_bins(track_arrays: dict,
                     full_key = f'{pfx}/{bk}'
                     if full_key in pair_beh:
                         vals = pair_beh[full_key][idx_arr].astype(np.float64)
-                        row[f'{bk}_prop'] = float(vals.sum() / n_bin) if n_bin > 0 else np.nan
+                        row[f'{bk}_prop'] = float(vals.sum() / n_expected)
 
                 # ── Engagement / disengagement proportions (frame-level) ────
                 eng_key = f'{pfx}/Engaged'
                 dis_key = f'{pfx}/Disengaged'
                 eng_vals = pair_beh[eng_key][idx_arr] if eng_key in pair_beh \
-                           else np.zeros(n_bin)
+                           else np.zeros(len(idx_arr))
                 dis_vals = pair_beh[dis_key][idx_arr] if dis_key in pair_beh \
-                           else np.zeros(n_bin)
-                row['Engaged_prop']    = float(eng_vals.sum() / n_bin) if n_bin > 0 else np.nan
-                row['Disengaged_prop'] = float(dis_vals.sum() / n_bin) if n_bin > 0 else np.nan
+                           else np.zeros(len(idx_arr))
+                row['Engaged_prop']    = float(eng_vals.sum() / n_expected)
+                row['Disengaged_prop'] = float(dis_vals.sum() / n_expected)
 
                 # ── Engagement-masked speeds: median of non-NaN values ──────
                 # WARNING: the engagement speed column names are hardcoded here.
@@ -649,7 +656,7 @@ def build_025s_bins(track_arrays: dict,
             engaged_bin = np.zeros(n_bins, dtype=np.int8)
             for bi, (_, s_idxs) in enumerate(bin_list):
                 idx_a = np.array(s_idxs, dtype=int)
-                prop  = float(eng_arr[idx_a].mean())
+                prop  = float(eng_arr[idx_a].sum()) / n_expected
                 engaged_bin[bi] = 1 if prop > 0.5 else 0
 
             # Detect bouts and attribute initiator/disengager at bin resolution

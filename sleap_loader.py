@@ -33,9 +33,12 @@ def load_sleap(path):
 
     # Detect (n_tracks, 2, n_nodes, n_frames) layout and transpose to
     # (n_frames, 2, n_nodes, n_tracks).
+    # Do NOT reset frame_idx here — the loaded frame_idx already has n_frames
+    # elements with the correct video-frame numbers from the H5 file.
+    # Resetting it to np.arange() would break sparse exports where frame_idx
+    # contains non-contiguous video frame numbers (e.g. [0, 5, 10, 20, ...]).
     if len(track_names) == tracks.shape[0] and len(node_names) == tracks.shape[2]:
         tracks = tracks.transpose(3, 1, 2, 0)
-        frame_idx = np.arange(tracks.shape[0])
 
     if len(node_names) != tracks.shape[2]:
         raise ValueError("Node name count does not match tracks node dimension.")

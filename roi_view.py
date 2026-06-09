@@ -107,12 +107,20 @@ class ROIView(QGraphicsView):
         self._roi_size = max(1, int(px))
 
     def _square_from_drag(self, origin, cur):
-        """Build a square QRectF from two points; side = max(|dx|, |dy|)."""
+        """Build a square QRectF from two points; side = max(|dx|, |dy|),
+        clamped so the square never exceeds the frame boundary."""
         dx = cur.x() - origin.x()
         dy = cur.y() - origin.y()
         side = max(abs(dx), abs(dy))
         if side == 0:
             return QRectF(origin, origin)
+        # Clamp the side so neither corner goes outside the frame.
+        # The origin is already clamped; we compute the maximum side that
+        # fits in each direction from origin, then take the smallest.
+        w, h = self._native_size
+        max_x = (w - origin.x()) if dx >= 0 else origin.x()
+        max_y = (h - origin.y()) if dy >= 0 else origin.y()
+        side  = min(side, max_x, max_y)
         x1 = origin.x() + (side if dx >= 0 else -side)
         y1 = origin.y() + (side if dy >= 0 else -side)
         return QRectF(origin, QPointF(x1, y1)).normalized()
