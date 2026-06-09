@@ -773,6 +773,9 @@ def build_1s_from_025(animal_025: pd.DataFrame,
     # bin sizes will misalign 1 s boundaries unless bin_size_s divides 1.0 evenly
     # (e.g. 0.5 s → 2 sub-bins, 0.1 s → 10 sub-bins are also safe).  Non-divisors
     # such as 0.3 s would cause fractional bins_per_s and incorrect bin grouping.
+    assert abs(1.0 % bin_size_s) < 1e-9, (
+        f"bin_size_s={bin_size_s} does not divide 1.0 evenly; "
+        "1 s aggregation would misalign bin boundaries.")
     bins_per_s = round(1.0 / bin_size_s)   # 4 for 0.25 s bins
 
     def _derive(df: pd.DataFrame, id_cols: list) -> pd.DataFrame:

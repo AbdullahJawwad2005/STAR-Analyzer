@@ -126,7 +126,7 @@ def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
     return filled
 
 
-def smooth_sleap_allnodes(coords, med_win=3, sg_win=5, poly=3):
+def smooth_sleap_allnodes(coords, med_win=3, sg_win=5, poly=2):
     coords = np.asarray(coords, dtype=float)
     smoothed = np.copy(coords)
 

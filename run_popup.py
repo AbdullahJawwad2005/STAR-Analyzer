@@ -212,10 +212,23 @@ class _ExportWorker(QObject):
                 df.to_csv(path, index=False)
             else:
                 # ---- Zone summary (unique frames per track/zone, NaN/Undetected excluded) ----
-                detected = df[df["Zone"] != "Undetected"]
+                # Filter to one node per animal per frame (body-centre preferred; first node
+                # as fallback) so a single frame is never counted toward multiple zones due
+                # to different body parts landing in different zones simultaneously.
+                _zone_node = None
+                for _pat in ('center', 'body', 'cm', 'centroid'):
+                    for _nn in node_names:
+                        if _pat in _nn.lower():
+                            _zone_node = _nn
+                            break
+                    if _zone_node is not None:
+                        break
+                if _zone_node is None:
+                    _zone_node = node_names[0]
+
+                detected = df[(df["Zone"] != "Undetected") & (df["Body Part"] == _zone_node)]
                 summary = (
-                    detected.drop_duplicates(subset=["Frame", "Track", "Zone"])
-                    .groupby(["Track", "Zone"], sort=False)
+                    detected.groupby(["Track", "Zone"], sort=False)
                     .size()
                     .reset_index(name="Frame Count")
                 )
@@ -890,6 +903,8 @@ class RunPopUp(QWidget):
         self._worker.error.connect(self._on_process_error)
         self._worker.finished.connect(self._proc_thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.error.connect(self._proc_thread.quit)
+        self._worker.error.connect(self._worker.deleteLater)
         self._proc_thread.finished.connect(self._proc_thread.deleteLater)
 
         self._proc_thread.start()
@@ -922,18 +937,20 @@ class RunPopUp(QWidget):
         frame_map  = data["frame_map"]
 
         roi = self.view.roi_native()
-        if roi is not None:
-            (rx0, ry0), (rx1, ry1), side = roi
-            px_per_cm = side / max(self._spin_arena_cm.value(), 1)
-        else:
-            px_per_cm = 1.0
+        if roi is None:
+            # Overlay cm-unit values are meaningless without a calibrated ROI.
+            # The Process button requires an ROI, so this path is only reachable
+            # in unusual edge cases (e.g. ROI cleared after processing).
+            return
+        (rx0, ry0), (rx1, ry1), side = roi
+        px_per_cm = side / max(self._spin_arena_cm.value(), 1)
 
         kin         = compute_kinematics(tracks, self._fps)
         single_beh  = compute_single_animal(tracks, kin, node_names, self._fps)
         pair_beh    = compute_pairwise(tracks, node_names, self._fps, dsr=None)
         track_feat, pair_feat = precompute_feature_arrays(
             tracks, kin, node_names, self._fps,
-            roi=(rx0, ry0, rx1, ry1) if roi is not None else None)
+            roi=(rx0, ry0, rx1, ry1))
 
         # Resolve body-center node index
         body_idx = None
@@ -1129,6 +1146,13 @@ class RunPopUp(QWidget):
         QMessageBox.critical(self, "Export failed", msg)
 
     def closeEvent(self, event):
+        if self._export_thread is not None and self._export_thread.isRunning():
+            QMessageBox.warning(
+                self, "Export in progress",
+                "An export is currently running.\n"
+                "Please wait for it to finish before closing.")
+            event.ignore()
+            return
         self._timer.stop()
         self._cap.release()
         super().closeEvent(event)
