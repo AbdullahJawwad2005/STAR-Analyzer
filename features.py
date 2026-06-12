@@ -201,24 +201,48 @@ def _shape_features_per_track(tracks, t):
                 compactness=compactness, circularity=circularity)
 
 
-def _hourglass_area(tracks, node_names, t):
-    """Area of the nose-hipL-hipR (or nose-earL-earR) triangle. (n_frames,)"""
+def _tri_area(ax, ay, bx, by, cx, cy):
+    """Signed triangle area via cross-product (vectorised). Returns (n_frames,)."""
+    return 0.5 * np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
+
+
+def _hourglass_triangles(tracks, node_names, t):
+    """Upper (cm-earL-earR) and lower (cm-hipL-hipR) triangle areas.
+
+    Returns (upper, lower) each (n_frames,). NaN where required nodes missing.
+    """
     n_frames = tracks.shape[0]
-    n_idx = find_node_idx(node_names, 'nose')
-    l_idx = find_node_idx(node_names, 'hip_l', 'hl', 'ear_l', 'el')
-    r_idx = find_node_idx(node_names, 'hip_r', 'hr', 'ear_r', 'er')
+    cm_idx  = find_node_idx(node_names, 'center', 'body', 'cm', 'centroid')
+    el_idx  = find_node_idx(node_names, 'ear_l', 'el')
+    er_idx  = find_node_idx(node_names, 'ear_r', 'er')
+    hl_idx  = find_node_idx(node_names, 'hip_l', 'hl')
+    hr_idx  = find_node_idx(node_names, 'hip_r', 'hr')
 
-    if n_idx is None or l_idx is None or r_idx is None:
-        return np.full(n_frames, np.nan)
+    nan_arr = np.full(n_frames, np.nan)
 
-    ax = tracks[:, 0, n_idx, t];  ay = tracks[:, 1, n_idx, t]
-    bx = tracks[:, 0, l_idx, t];  by = tracks[:, 1, l_idx, t]
-    cx = tracks[:, 0, r_idx, t];  cy = tracks[:, 1, r_idx, t]
+    # Upper triangle: cm, ear_l, ear_r
+    if cm_idx is not None and el_idx is not None and er_idx is not None:
+        cx = tracks[:, 0, cm_idx, t]; cy = tracks[:, 1, cm_idx, t]
+        elx = tracks[:, 0, el_idx, t]; ely = tracks[:, 1, el_idx, t]
+        erx = tracks[:, 0, er_idx, t]; ery = tracks[:, 1, er_idx, t]
+        upper = _tri_area(cx, cy, elx, ely, erx, ery)
+        bad = np.isnan(cx) | np.isnan(elx) | np.isnan(erx)
+        upper[bad] = np.nan
+    else:
+        upper = nan_arr.copy()
 
-    area = 0.5 * np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
-    bad  = np.isnan(ax) | np.isnan(bx) | np.isnan(cx)
-    area[bad] = np.nan
-    return area
+    # Lower triangle: cm, hip_l, hip_r
+    if cm_idx is not None and hl_idx is not None and hr_idx is not None:
+        cx = tracks[:, 0, cm_idx, t]; cy = tracks[:, 1, cm_idx, t]
+        hlx = tracks[:, 0, hl_idx, t]; hly = tracks[:, 1, hl_idx, t]
+        hrx = tracks[:, 0, hr_idx, t]; hry = tracks[:, 1, hr_idx, t]
+        lower = _tri_area(cx, cy, hlx, hly, hrx, hry)
+        bad = np.isnan(cx) | np.isnan(hlx) | np.isnan(hrx)
+        lower[bad] = np.nan
+    else:
+        lower = nan_arr.copy()
+
+    return upper, lower
 
 
 # ---------------------------------------------------------------------------
@@ -227,12 +251,12 @@ def _hourglass_area(tracks, node_names, t):
 
 def _path_efficiency(cm_x, cm_y, fps):
     """
-    Rolling 1-second path efficiency: straight-line / cumulative path.
+    Rolling 3-second path efficiency: straight-line / cumulative path.
     Values in [0, 1]; 1.0 = perfectly straight.
 
     Formula: efficiency[f] = straight_line_distance / cumulative_path_length,
     where both quantities are measured over the W-frame window ending at frame f
-    (W = round(fps), i.e. approximately 1 second of history).
+    (W = round(3 * fps), i.e. approximately 3 seconds of history).
     Straight-line distance = Euclidean distance from the position W frames ago
     to the current position.
     Cumulative path length = sum of per-frame step distances over the same window.
@@ -244,7 +268,7 @@ def _path_efficiency(cm_x, cm_y, fps):
                to total distance travelled.
     """
     n = len(cm_x)
-    W = max(1, int(round(fps)))
+    W = max(1, int(round(3 * fps)))
 
     dx   = np.diff(cm_x, prepend=cm_x[0])
     dy   = np.diff(cm_y, prepend=cm_y[0])
@@ -261,6 +285,12 @@ def _path_efficiency(cm_x, cm_y, fps):
     with np.errstate(invalid='ignore', divide='ignore'):
         eff = np.where(path_in_win > 1e-6, straight / path_in_win, 1.0)
     return np.clip(eff, 0.0, 1.0)
+
+
+def _speed_accel(speed_arr, fps):
+    """d(speed)/dt — rate of change of speed magnitude. (n_frames,)"""
+    clean = np.nan_to_num(speed_arr, nan=0.0)
+    return np.gradient(clean) * fps
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +423,13 @@ def _pair_features(tracks, kin, node_names, fps):
         app_B    = np.minimum(app_B, 360 - app_B)
         out[f'{pfx}/approach_angle_B'] = app_B
 
+        # --- Velocity cosine similarity ---
+        vxA = np.gradient(cm_A[:, 0]); vyA = np.gradient(cm_A[:, 1])
+        vxB = np.gradient(cm_B[:, 0]); vyB = np.gradient(cm_B[:, 1])
+        dot = vxA * vxB + vyA * vyB
+        mag = np.hypot(vxA, vyA) * np.hypot(vxB, vyB)
+        out[f'{pfx}/velocity_cos_sim'] = np.where(mag > 1e-12, dot / mag, 0.0)
+
         # --- Visual scope (A sees B, B sees A) ---
         # Binocular < 20°, Monocular < 120°, None otherwise
         vis_A = np.full(n_frames, 'None',      dtype=object)
@@ -459,7 +496,12 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
 
         fa.update(_node_pair_features(tracks, node_names, t))
         fa.update(_shape_features_per_track(tracks, t))
-        fa['hourglass_area'] = _hourglass_area(tracks, node_names, t)
+
+        upper, lower = _hourglass_triangles(tracks, node_names, t)
+        fa['hourglass_area'] = np.where(
+            np.isnan(upper) & np.isnan(lower), np.nan,
+            np.nan_to_num(upper, nan=0.0) + np.nan_to_num(lower, nan=0.0))
+        fa['hourglass_ratio'] = np.where(lower > 1e-10, upper / lower, np.nan)
 
         hdg = _heading_deg(tracks, kin, body_idx, t)
         fa['curvature'] = np.abs(angular_velocity(hdg, fps))
@@ -472,6 +514,11 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
             cm[:, 1],
             nan=float(np.nanmean(cm[:, 1])) if np.any(np.isfinite(cm[:, 1])) else 0.0)
         fa['path_efficiency'] = _path_efficiency(cm_x, cm_y, fps)
+
+        body_spd = (kin['speed'][:, body_idx, t] if body_idx is not None
+                    else np.nanmean(kin['speed'][:, :, t], axis=1))
+        fa['speed_accel'] = _speed_accel(body_spd, fps)
+
         fa['cm_total_disp'] = (node_disp[body_idx] if body_idx is not None
                                else np.mean([node_disp[n] for n in range(n_nodes)], axis=0))
         fa['dist_roi_center'], fa['dist_roi_boundary'] = _roi_distances(
