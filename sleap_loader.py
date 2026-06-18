@@ -18,11 +18,7 @@ def load_sleap(path):
             if "edge_inds" in f
             else np.empty((0, 2), dtype=int)
         )
-        frame_idx = (
-            f["frame_idx"][:]
-            if "frame_idx" in f
-            else np.arange(tracks.shape[0])
-        )
+        frame_idx = f["frame_idx"][:] if "frame_idx" in f else None
 
     if tracks.ndim != 4 or tracks.shape[1] != 2:
         raise ValueError(
@@ -39,6 +35,11 @@ def load_sleap(path):
     # contains non-contiguous video frame numbers (e.g. [0, 5, 10, 20, ...]).
     if len(track_names) == tracks.shape[0] and len(node_names) == tracks.shape[2]:
         tracks = tracks.transpose(3, 1, 2, 0)
+
+    # Fallback: generate sequential frame indices only after any transpose so the
+    # length matches the final (n_frames, ...) first dimension.
+    if frame_idx is None:
+        frame_idx = np.arange(tracks.shape[0])
 
     if len(node_names) != tracks.shape[2]:
         raise ValueError("Node name count does not match tracks node dimension.")

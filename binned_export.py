@@ -92,9 +92,9 @@ def _classify_feat(name: str) -> str:
         'position'    raw x/y coordinates               → mean
         'distance'    Euclidean distances, areas, paths  → mean + median
         'angular'     wrapped angles in degrees          → circular mean
-        'velocity'    velocity components and speeds     → median + p90
-        'accel'       acceleration                       → median + p90
-        'jerk'        jerk (3rd derivative of position)  → |median| + |p90|
+        'velocity'    velocity components and speeds     → median + p95
+        'accel'       acceleration                       → median + p95
+        'jerk'        jerk (3rd derivative of position)  → |median| + |p95|
         'binary'      0/1 flag arrays                   → proportion
         'shape'       body-shape scalars                 → mean
         'engage_spd'  engagement-masked speed columns    → median (NaN-safe)
@@ -108,7 +108,9 @@ def _classify_feat(name: str) -> str:
         return 'position'
 
     # ── Angular  (check before velocity; '_ang_mot' must not match velocity) ─
-    if any(k in n for k in ('_angle', 'ang_mot', 'heading', 'curvature',
+    if 'curvature' in n:
+        return 'velocity'
+    if any(k in n for k in ('_angle', 'ang_mot', 'heading',
                              'approach_angle')):
         return 'angular'
 
@@ -133,11 +135,24 @@ def _classify_feat(name: str) -> str:
     if 'accel' in n:
         return 'accel'
 
+    # ── Shape / geometry scalars ──────────────────────────────────────────────
+    # NOTE: this check MUST come before the binary check below, because the
+    # short binary keyword 'ho' (Head-On behavior) is a substring of
+    # 'hourglass', which would otherwise misclassify hourglass features.
+    if any(k in n for k in ('elongation', 'eccentricity', 'compactness',
+                             'circularity', 'hourglass', 'path_eff',
+                             'position_entropy', 'total_disp')):
+        return 'shape'
+
     # ── Binary behavior flags ─────────────────────────────────────────────────
     _BINARY = ('stationary', 'walking', 'running', 'turning', 'dir_reversal',
                'nosenose', 'nosehead', 'nosebody', 'noserear',
                'contact', 'cooriented', 'antioriented',
-               'engaged', 'disengaged')
+               'engaged', 'disengaged',
+               'hh', 'ho', 'sniff',
+               'follow', 'chase', 'flee', 'approach',
+               'activeavoid', 'passiveavoid', 'stationaryprox',
+               'socialorient', 'visualattn', 'auditoryattn')
     if any(k in n for k in _BINARY):
         return 'binary'
 
@@ -153,12 +168,6 @@ def _classify_feat(name: str) -> str:
     if any(k in n for k in ('engagespeed', 'disengagespeed',
                              'engageonsetspe', 'disengageonsetsp')):
         return 'engage_spd'
-
-    # ── Shape / geometry scalars ──────────────────────────────────────────────
-    if any(k in n for k in ('elongation', 'eccentricity', 'compactness',
-                             'circularity', 'hourglass', 'path_eff',
-                             'position_entropy', 'total_disp')):
-        return 'shape'
 
     # ── Distances and related numeric measures ────────────────────────────────
     if any(k in n for k in ('dist', 'area', 'covar', 'corr')):
@@ -219,17 +228,17 @@ def _agg_025(arr: np.ndarray, category: str) -> dict:
         return {'_cmean': _circular_mean_deg(ok)}
 
     if category in ('velocity', 'accel'):
-        # p90 captures burst events that a median alone would miss
-        return {'_median': _q(50), '_p90': _q(90)}
+        # p95 captures burst events that a median alone would miss
+        return {'_median': _q(50), '_p95': _q(95)}
 
     if category == 'jerk':
         # Direction is noise at the jerk floor; use absolute values so that
         # large positive/negative jerks don't cancel in the bin mean.
         med = _q(50)
-        p90 = _q(90)
+        p95 = _q(95)
         return {
             '_absmedian': abs(med) if np.isfinite(med) else np.nan,
-            '_absp90':    abs(p90) if np.isfinite(p90) else np.nan,
+            '_absp95':    abs(p95) if np.isfinite(p95) else np.nan,
         }
 
     if category == 'binary':
@@ -482,7 +491,7 @@ def build_025s_bins(track_arrays: dict,
     n_bins   = len(bin_list)
 
     # Body-centre node for covariance re-computation and approach angles
-    body_idx = find_node_idx(node_names, 'center', 'body', 'cm', 'centroid')
+    body_idx = find_node_idx(node_names, 'body')
 
     # ── Pre-classify track feature columns (done once, not per-bin) ───────────
     # Skip categorical columns entirely (strings don't aggregate numerically).
@@ -538,10 +547,11 @@ def build_025s_bins(track_arrays: dict,
                     row[col + suf] = val
 
             # Single-animal behavior proportions (stationary/walking/running/…)
+            denom = max(n_expected, len(idx_arr))
             for bk in ('stationary', 'walking', 'running', 'turning', 'dir_reversal'):
                 if bk in single_beh:
                     vals = single_beh[bk][idx_arr, t].astype(np.float64)
-                    row[f'{bk}_prop'] = float(vals.sum() / n_expected)
+                    row[f'{bk}_prop'] = float(vals.sum() / denom)
 
             animal_rows.append(row)
 
@@ -591,14 +601,26 @@ def build_025s_bins(track_arrays: dict,
                 # kept in sync with the behavior types produced by compute_pairwise() in
                 # behaviors.py.  If a new proximity behavior key is added to that function,
                 # it must also be added to this list for it to appear in the binned export.
+                denom = max(n_expected, len(idx_arr))
                 for bk in ('NoseNose', 'NoseHead_AtoB', 'NoseHead_BtoA',
                             'NoseBody_AtoB', 'NoseBody_BtoA',
                             'NoseRear_AtoB', 'NoseRear_BtoA',
-                            'Contact', 'CoOriented', 'AntiOriented'):
+                            'Contact', 'CoOriented', 'AntiOriented',
+                            'HH', 'HO', 'Sniff_AtoB', 'Sniff_BtoA',
+                            'Follow_AtoB', 'Follow_BtoA',
+                            'Chase_AtoB', 'Chase_BtoA',
+                            'Flee_AtoB', 'Flee_BtoA',
+                            'Approach_AtoB', 'Approach_BtoA',
+                            'ActiveAvoid_AtoB', 'ActiveAvoid_BtoA',
+                            'PassiveAvoid_AtoB', 'PassiveAvoid_BtoA',
+                            'StationaryProx',
+                            'SocialOrient_AtoB', 'SocialOrient_BtoA',
+                            'VisualAttn_AtoB', 'VisualAttn_BtoA',
+                            'AuditoryAttn_AtoB', 'AuditoryAttn_BtoA'):
                     full_key = f'{pfx}/{bk}'
                     if full_key in pair_beh:
                         vals = pair_beh[full_key][idx_arr].astype(np.float64)
-                        row[f'{bk}_prop'] = float(vals.sum() / n_expected)
+                        row[f'{bk}_prop'] = float(vals.sum() / denom)
 
                 # ── Engagement / disengagement proportions (frame-level) ────
                 eng_key = f'{pfx}/Engaged'
@@ -607,8 +629,8 @@ def build_025s_bins(track_arrays: dict,
                            else np.zeros(len(idx_arr))
                 dis_vals = pair_beh[dis_key][idx_arr] if dis_key in pair_beh \
                            else np.zeros(len(idx_arr))
-                row['Engaged_prop']    = float(eng_vals.sum() / n_expected)
-                row['Disengaged_prop'] = float(dis_vals.sum() / n_expected)
+                row['Engaged_prop']    = float(eng_vals.sum() / denom)
+                row['Disengaged_prop'] = float(dis_vals.sum() / denom)
 
                 # ── Engagement-masked speeds: median of non-NaN values ──────
                 # WARNING: the engagement speed column names are hardcoded here.
@@ -656,7 +678,8 @@ def build_025s_bins(track_arrays: dict,
             engaged_bin = np.zeros(n_bins, dtype=np.int8)
             for bi, (_, s_idxs) in enumerate(bin_list):
                 idx_a = np.array(s_idxs, dtype=int)
-                prop  = float(eng_arr[idx_a].sum()) / n_expected
+                denom_e = max(n_expected, len(idx_a))
+                prop  = float(eng_arr[idx_a].sum()) / denom_e
                 engaged_bin[bi] = 1 if prop > 0.5 else 0
 
             # Detect bouts and attribute initiator/disengager at bin resolution
@@ -729,7 +752,7 @@ def _1s_agg_rule(col_name: str) -> str:
         'cmean'  — circular mean of the four sub-bin circular means
                    (for *_cmean angular columns)
         'mean'   — arithmetic mean of the four sub-bin values
-                   (for *_mean, *_median, *_p90, *_absmedian, *_absp90,
+                   (for *_mean, *_median, *_p95, *_absmedian, *_absp95,
                     *_bin covariance/correlation columns)
         'skip'   — omit from 1 s output
                    (for *_prop binary proportions and engagement columns)
@@ -744,7 +767,7 @@ def _1s_agg_rule(col_name: str) -> str:
     if n.endswith('_cmean'):
         return 'cmean'
 
-    # Everything else (mean, median, p90, abs*, bin covariances) → arithmetic mean
+    # Everything else (mean, median, p95, abs*, bin covariances) → arithmetic mean
     return 'mean'
 
 
@@ -818,7 +841,7 @@ def build_1s_from_025(animal_025: pd.DataFrame,
             row['BinTime_1s(s)'] = float(keys[0])   # first key is _1s_bin index
 
             # Arithmetic mean: covers position means, distance mean/median,
-            # velocity median/p90, acceleration, jerk, shape, covariance, …
+            # velocity median/p95, acceleration, jerk, shape, covariance, …
             for col in mean_cols:
                 vals = chunk[col].to_numpy(dtype=np.float64)
                 ok   = vals[np.isfinite(vals)]
@@ -855,7 +878,8 @@ def write_binned_xlsx(track_arrays: dict,
                       fps: float,
                       frame_map: dict,
                       kin: dict,
-                      output_path: str | Path) -> None:
+                      output_path: str | Path,
+                      include_sheets: dict | None = None) -> None:
     """
     Build all binned DataFrames and write them to a single Excel workbook.
 
@@ -890,27 +914,38 @@ def write_binned_xlsx(track_arrays: dict,
     frame_map    : {video_frame_idx -> sleap_data_idx}
     kin          : kinematics dict from compute_kinematics
     output_path  : destination .xlsx path (string or Path)
+    include_sheets : dict[str, bool] or None — keys like 'binned_animal_025',
+                     'binned_pair_025', etc.  None means write all sheets.
     """
-    # Build 0.25 s bins
+    def _want(key: str) -> bool:
+        return include_sheets.get(key, True) if include_sheets else True
+
+    # Always compute 0.25 s bins (1 s depends on them)
     animal_025, pair_025, eng_idx_025 = build_025s_bins(
         track_arrays, pair_arrays, single_beh, pair_beh,
         tracks, node_names, track_names, fps, frame_map,
         kin=kin,
     )
 
-    # Derive 1 s bins from the 0.25 s bins
-    animal_1s, pair_1s = build_1s_from_025(animal_025, pair_025)
+    # Derive 1 s bins from the 0.25 s bins (only if needed)
+    need_1s = _want('binned_animal_1s') or _want('binned_pair_1s')
+    if need_1s:
+        animal_1s, pair_1s = build_1s_from_025(animal_025, pair_025)
+    else:
+        animal_1s = pair_1s = pd.DataFrame()
 
     with pd.ExcelWriter(str(output_path), engine='openpyxl') as writer:
-        animal_025.to_excel(writer, sheet_name='Animal 0.25s', index=False)
+        if _want('binned_animal_025'):
+            animal_025.to_excel(writer, sheet_name='Animal 0.25s', index=False)
 
-        if not pair_025.empty:
+        if _want('binned_pair_025') and not pair_025.empty:
             pair_025.to_excel(writer, sheet_name='Pair 0.25s', index=False)
 
-        if not eng_idx_025.empty:
+        if _want('binned_eng_indices_025') and not eng_idx_025.empty:
             eng_idx_025.to_excel(writer, sheet_name='Eng Indices 0.25s', index=False)
 
-        animal_1s.to_excel(writer, sheet_name='Animal 1s', index=False)
+        if _want('binned_animal_1s') and not animal_1s.empty:
+            animal_1s.to_excel(writer, sheet_name='Animal 1s', index=False)
 
-        if not pair_1s.empty:
+        if _want('binned_pair_1s') and not pair_1s.empty:
             pair_1s.to_excel(writer, sheet_name='Pair 1s', index=False)

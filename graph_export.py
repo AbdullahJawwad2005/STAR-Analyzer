@@ -18,6 +18,7 @@ import numpy as np
 from itertools import combinations
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from behaviors import find_node_idx
 
 # Agg backend MUST be set before importing pyplot
 import matplotlib
@@ -29,7 +30,6 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import Normalize, LinearSegmentedColormap
 import matplotlib as _mpl
 import matplotlib.cm as _cm_module
-import matplotlib.patheffects
 from matplotlib.ticker import MaxNLocator
 
 
@@ -59,10 +59,10 @@ _ZONE_LABEL = {
 _ALL_ZONES = ["C1", "W1", "C2", "W4", "Open", "W2", "C4", "W3", "C3"]
 
 _NICE_LABEL = {
-    "speed":             "Speed (px/frame)",
-    "speed_accel":       "Speed Accel (px/frame\u00b2/s)",
-    "accel":             "Accel (px/frame\u00b2)",
-    "jerk":              "Jerk (px/frame\u00b3)",
+    "speed":             "Speed (px/s)",
+    "speed_accel":       "Speed Accel (px/s\u00b2)",
+    "accel":             "Accel (px/s\u00b2)",
+    "jerk":              "Jerk (px/s\u00b3)",
     "hourglass_area":    "Hourglass Area (px\u00b2)",
     "hourglass_ratio":   "Hourglass Ratio (upper/lower)",
     "inter_animal_dist": "Inter-Animal Dist. (px)",
@@ -100,17 +100,15 @@ def _get_times_and_indices(frame_map, fps):
     items = sorted(frame_map.items())
     vid_frames = np.array([vf for vf, _ in items])
     sleap_idxs = np.array([si for _, si in items], dtype=int)
-    times_s    = vid_frames / fps
+    times_s    = (vid_frames - vid_frames[0]) / fps if len(vid_frames) else vid_frames / fps
     return times_s, sleap_idxs
 
 
 def _body_prefix(node_names):
     """Return the node-name prefix (with spaces -> underscores) for the body-centre node."""
-    for pat in ("center", "body", "cm", "centroid"):
-        for nn in node_names:
-            if pat in nn.lower():
-                return nn.replace(" ", "_")
-    return node_names[0].replace(" ", "_") if node_names else "body"
+    idx = find_node_idx(node_names, 'body')
+    nn = node_names[idx] if idx is not None else (node_names[0] if node_names else "body")
+    return nn.replace(" ", "_")
 
 
 def _extract(track_arr, key, sleap_idxs):
@@ -133,18 +131,10 @@ def _downsample_idx(n, max_pts):
 # ---------------------------------------------------------------------------
 
 def _write_heatmaps(zone_summary_df, track_names, pdf_path, status_cb,
-                    arena_cm=40, strip_cm=8, arena_snapshot=None):
-    """One PDF page per animal: zone occupancy overlaid on arena photograph.
-
-    When arena_snapshot (RGB ndarray) is provided the photo is rendered as a
-    desaturated background image and each zone gets a semi-transparent colour
-    overlay proportional to occupancy.  Without a snapshot the figure falls back
-    to opaque coloured cells (same data, no photo).
-    """
+                    arena_cm=40, strip_cm=8, **_kw):
+    """One PDF page per animal: proportional opaque-cell zone occupancy heatmap."""
     if status_cb:
         status_cb("Graphs: zone heatmaps\u2026")
-
-    import matplotlib.patches as mpatches
 
     # Determine colour range across all animals for a consistent scale
     all_pcts = zone_summary_df["% of Session"].values.astype(float)
@@ -155,18 +145,6 @@ def _write_heatmaps(zone_summary_df, track_names, pdf_path, status_cb,
     # Proportional ratios: corner/wall strips vs centre
     f = max(0.02, min(strip_cm / max(arena_cm, 1), 0.45))
 
-    # Prepare desaturated snapshot if available
-    desat_img = None
-    if arena_snapshot is not None:
-        try:
-            img = arena_snapshot.astype(np.float64) / 255.0
-            gray = 0.299 * img[:, :, 0] + 0.587 * img[:, :, 1] + 0.114 * img[:, :, 2]
-            # Blend: 30% colour, 70% grey → muted background that doesn't compete
-            desat_img = 0.30 * img + 0.70 * np.stack([gray]*3, axis=-1)
-            desat_img = np.clip(desat_img, 0, 1)
-        except Exception:
-            desat_img = None
-
     with PdfPages(pdf_path) as pdf:
         for track_name in track_names:
             sub     = zone_summary_df[zone_summary_df["Track"] == track_name]
@@ -176,121 +154,43 @@ def _write_heatmaps(zone_summary_df, track_names, pdf_path, status_cb,
 
             fig = plt.figure(figsize=(9, 9.8))
 
-            if desat_img is not None:
-                # --- Photo-overlay mode ---
-                # Single axes showing the arena photo with zone rectangles overlaid
-                ax_img = fig.add_axes([0.05, 0.08, 0.82, 0.82])
-                ax_img.imshow(desat_img, aspect="equal", interpolation="bilinear")
-                ax_img.set_xticks([]); ax_img.set_yticks([])
-                for sp in ax_img.spines.values():
-                    sp.set_edgecolor("#444444"); sp.set_linewidth(2.0)
+            ratios = [f, 1 - 2 * f, f]
+            gs = gridspec.GridSpec(3, 3, figure=fig,
+                                   width_ratios=ratios, height_ratios=ratios,
+                                   wspace=0.05, hspace=0.05)
+            fig.suptitle(f"Zone Occupancy Heatmap  \u2014  {track_name}",
+                         fontsize=14, fontweight="bold")
 
-                h, w = desat_img.shape[:2]
-                s_px = f * w   # strip width in image pixels
-                s_py = f * h
-
-                # Zone bounding boxes in image pixel coordinates
-                zone_rects = {
-                    "C1":   (0,          0,          s_px,        s_py),
-                    "W1":   (s_px,       0,          w - 2*s_px,  s_py),
-                    "C2":   (w - s_px,   0,          s_px,        s_py),
-                    "W4":   (0,          s_py,       s_px,        h - 2*s_py),
-                    "Open": (s_px,       s_py,       w - 2*s_px,  h - 2*s_py),
-                    "W2":   (w - s_px,   s_py,       s_px,        h - 2*s_py),
-                    "C4":   (0,          h - s_py,   s_px,        s_py),
-                    "W3":   (s_px,       h - s_py,   w - 2*s_px,  s_py),
-                    "C3":   (w - s_px,   h - s_py,   s_px,        s_py),
-                }
-
-                for zone, (zx, zy, zw, zh) in zone_rects.items():
-                    pct  = pct_map.get(zone, 0.0)
+            axes_flat = []
+            for r, row_zones in enumerate(_ZONE_GRID):
+                for c, zone in enumerate(row_zones):
+                    ax  = fig.add_subplot(gs[r, c])
+                    axes_flat.append(ax)
+                    pct = pct_map.get(zone, 0.0)
                     rgba = cmap(norm(pct))
-                    # Semi-transparent colour overlay (alpha scales with occupancy)
-                    alpha = 0.30 + 0.45 * min(pct / max(vmax, 1e-6), 1.0)
+                    ax.set_facecolor(rgba)
 
-                    rect = mpatches.Rectangle(
-                        (zx, zy), zw, zh,
-                        linewidth=1.5, edgecolor="white",
-                        facecolor=rgba[:3], alpha=alpha)
-                    ax_img.add_patch(rect)
+                    lum  = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+                    tcol = "white" if lum < 0.55 else "#222222"
 
-                    # Zone dashed border for clarity
-                    rect_border = mpatches.Rectangle(
-                        (zx, zy), zw, zh,
-                        linewidth=1.2, edgecolor="white", linestyle="--",
-                        facecolor="none", alpha=0.6)
-                    ax_img.add_patch(rect_border)
+                    label = _ZONE_LABEL.get(zone, zone)
+                    ax.text(0.5, 0.62, label,
+                            ha="center", va="center", fontsize=11,
+                            fontweight="bold", transform=ax.transAxes,
+                            color=tcol, multialignment="center")
+                    ax.text(0.5, 0.30, f"{pct:.1f} %",
+                            ha="center", va="center", fontsize=16,
+                            fontweight="bold", transform=ax.transAxes,
+                            color=tcol)
 
-                    # Text: zone label + percentage
-                    cx_t = zx + zw / 2
-                    cy_t = zy + zh / 2
+                    ax.set_xticks([]); ax.set_yticks([])
+                    for sp in ax.spines.values():
+                        sp.set_edgecolor("#666666"); sp.set_linewidth(1.8)
 
-                    # Choose text colour: white with dark outline for readability
-                    ax_img.text(cx_t, cy_t - zh * 0.10,
-                                _ZONE_LABEL.get(zone, zone),
-                                ha="center", va="center", fontsize=10,
-                                fontweight="bold", color="white",
-                                multialignment="center",
-                                path_effects=[
-                                    matplotlib.patheffects.withStroke(
-                                        linewidth=2.5, foreground="black")])
-                    ax_img.text(cx_t, cy_t + zh * 0.15,
-                                f"{pct:.1f}%",
-                                ha="center", va="center", fontsize=14,
-                                fontweight="bold", color="white",
-                                path_effects=[
-                                    matplotlib.patheffects.withStroke(
-                                        linewidth=3, foreground="black")])
-
-                fig.suptitle(f"Zone Occupancy  \u2014  {track_name}",
-                             fontsize=14, fontweight="bold", y=0.95)
-
-                # Colorbar
-                sm = _cm_module.ScalarMappable(cmap=cmap, norm=norm)
-                sm.set_array([])
-                cax = fig.add_axes([0.89, 0.08, 0.025, 0.82])
-                cbar = fig.colorbar(sm, cax=cax)
-                cbar.set_label("% of Session", fontsize=11)
-
-            else:
-                # --- Fallback: coloured-cell mode (no photo) ---
-                ratios = [f, 1 - 2 * f, f]
-                gs = gridspec.GridSpec(3, 3, figure=fig,
-                                       width_ratios=ratios, height_ratios=ratios,
-                                       wspace=0.05, hspace=0.05)
-                fig.suptitle(f"Zone Occupancy Heatmap  \u2014  {track_name}",
-                             fontsize=14, fontweight="bold")
-
-                axes_flat = []
-                for r, row_zones in enumerate(_ZONE_GRID):
-                    for c, zone in enumerate(row_zones):
-                        ax  = fig.add_subplot(gs[r, c])
-                        axes_flat.append(ax)
-                        pct = pct_map.get(zone, 0.0)
-                        rgba = cmap(norm(pct))
-                        ax.set_facecolor(rgba)
-
-                        lum  = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
-                        tcol = "white" if lum < 0.55 else "#222222"
-
-                        label = _ZONE_LABEL.get(zone, zone)
-                        ax.text(0.5, 0.62, label,
-                                ha="center", va="center", fontsize=11,
-                                fontweight="bold", transform=ax.transAxes,
-                                color=tcol, multialignment="center")
-                        ax.text(0.5, 0.30, f"{pct:.1f} %",
-                                ha="center", va="center", fontsize=16,
-                                fontweight="bold", transform=ax.transAxes,
-                                color=tcol)
-
-                        ax.set_xticks([]); ax.set_yticks([])
-                        for sp in ax.spines.values():
-                            sp.set_edgecolor("#666666"); sp.set_linewidth(1.8)
-
-                sm = _cm_module.ScalarMappable(cmap=cmap, norm=norm)
-                sm.set_array([])
-                cbar = fig.colorbar(sm, ax=axes_flat, fraction=0.025, pad=0.03)
-                cbar.set_label("% of Session", fontsize=11)
+            sm = _cm_module.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            cbar = fig.colorbar(sm, ax=axes_flat, fraction=0.025, pad=0.03)
+            cbar.set_label("% of Session", fontsize=11)
 
             pdf.savefig(fig, dpi=150)
             plt.close(fig)
@@ -310,9 +210,9 @@ def _write_cascade_plot(track_arrays, times, sleap_idxs, track_names,
     bp = _body_prefix(node_names)
 
     panels = [
-        (f"{bp}_speed",  "Speed (px/frame)",            "#2196F3"),
-        ("speed_accel",  "Speed Accel (px/frame\u00b2/s)", "#FF9800"),
-        (f"{bp}_jerk",   "Jerk (px/frame\u00b3)",          "#E91E63"),
+        (f"{bp}_speed",  "Speed (px/s)",       "#2196F3"),
+        ("speed_accel",  "Speed Accel (px/s\u00b2)", "#FF9800"),
+        (f"{bp}_jerk",   "Jerk (px/s\u00b3)",       "#E91E63"),
     ]
 
     with PdfPages(pdf_path) as pdf:
@@ -357,7 +257,7 @@ def _write_cascade_plot(track_arrays, times, sleap_idxs, track_names,
 
 def _write_distance_plot(pair_arrays, times, sleap_idxs, track_names,
                          pdf_path, status_cb, px_per_cm=1.0):
-    """One page per pair: inter-animal distance with <= 3cm proximity highlighted."""
+    """One page per pair: inter-animal distance with <= 4cm proximity highlighted."""
     if status_cb:
         status_cb("Graphs: distance plots\u2026")
 
@@ -391,12 +291,12 @@ def _write_distance_plot(pair_arrays, times, sleap_idxs, track_names,
                 ax.plot(t_ds[fin], d_ds[fin], linewidth=0.9,
                         color="#1565C0", alpha=0.85, label="Distance (cm)")
                 ax.fill_between(t_ds, 0, d_ds,
-                                where=(d_ds <= 3.0) & fin,
+                                where=(d_ds <= 4.0) & fin,
                                 alpha=0.3, color="red",
-                                label="Proximity (\u2264 3 cm)")
+                                label="Proximity (\u2264 4 cm)")
 
-            ax.axhline(3.0, color="#B71C1C", linewidth=1.0, linestyle="--",
-                       alpha=0.7, label="3 cm threshold")
+            ax.axhline(4.0, color="#B71C1C", linewidth=1.0, linestyle="--",
+                       alpha=0.7, label="4 cm threshold")
             ax.set_xlabel("Time (s)", fontsize=10)
             ax.set_ylabel("Inter-Animal Distance (cm)", fontsize=10)
             ax.set_title(f"Inter-Animal Distance  \u2014  {pair_label}",
@@ -418,6 +318,21 @@ def _write_distance_plot(pair_arrays, times, sleap_idxs, track_names,
 
 _ONCO_CMAP = LinearSegmentedColormap.from_list(
     'onco', ['#2166ac', '#f7f7f7', '#b2182b'])
+
+
+def _circular_mean_360(angles):
+    """Circular mean for angles in [0, 360) degrees. Returns scalar."""
+    rad = np.radians(angles)
+    finite = np.isfinite(rad)
+    if not np.any(finite):
+        return np.nan
+    s = np.nanmean(np.sin(rad[finite]))
+    c = np.nanmean(np.cos(rad[finite]))
+    result = np.degrees(np.arctan2(s, c)) % 360.0
+    # Guard: arctan2 can return tiny negatives that % 360 maps to ≈360.0
+    if result >= 360.0:
+        result = 0.0
+    return result
 
 
 def _find_dist_key(keys, patterns_a, patterns_b):
@@ -456,19 +371,23 @@ def _norm_correlation(arr):
     return np.clip((arr + 1.0) / 2.0, 0.0, 1.0)
 
 
-def _norm_p90(chunk_means, session_p90):
-    """cell = chunk_mean / session_p90, clamped [0, 1]."""
-    if session_p90 < 1e-12:
+def _norm_p95(chunk_means, session_p95):
+    """cell = chunk_mean / session_p95, clamped [0, 1]."""
+    if session_p95 < 1e-12:
         return np.full_like(chunk_means, 0.5, dtype=float)
-    return np.clip(chunk_means / session_p90, 0.0, 1.0)
+    return np.clip(chunk_means / session_p95, 0.0, 1.0)
 
 
 def _render_oncoplot(matrix, row_labels, section_breaks, times, title,
-                     pdf, show_values=True):
+                     pdf, show_values=True, compact=False):
     """Render a single oncoplot page and save to the open PdfPages."""
     n_rows, n_bins = matrix.shape
-    fig_w = max(14, n_bins * 0.45)
-    fig_h = max(6, n_rows * 0.4)
+    if compact:
+        fig_w = max(10, n_bins * 0.22)
+        fig_h = max(4, n_rows * 0.25)
+    else:
+        fig_w = max(14, n_bins * 0.45)
+        fig_h = max(6, n_rows * 0.4)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     ax.imshow(matrix, aspect='auto', cmap=_ONCO_CMAP, vmin=0, vmax=1,
@@ -517,17 +436,25 @@ def _render_oncoplot(matrix, row_labels, section_breaks, times, title,
 # 4. Per-Animal Feature Oncoplot
 # ---------------------------------------------------------------------------
 
-def _write_oncoplot(track_arrays, times, sleap_idxs, track_names,
-                    node_names, fps, pdf_path, status_cb):
-    """Per-animal feature oncoplot: rows = features (4 sections), cols = 10s bins."""
-    if status_cb:
-        status_cb("Graphs: feature oncoplot\u2026")
+def _compute_oncoplot_matrix(track_arrays, times, sleap_idxs, track_names,
+                             node_names, fps):
+    """Compute per-animal oncoplot matrices without rendering.
 
+    Returns
+    -------
+    matrix_per_track : dict[int, ndarray]
+        matrix_per_track[t_idx] = (n_rows, n_bins) normalised matrix
+    row_labels : list[str]
+    section_breaks : list[int]
+    global_stats : list
+    raw_vals : list[list]
+        raw_vals[row_idx][t_idx] = (n_bins,) bin means (or tuple for p95)
+    """
     bp = _body_prefix(node_names)
     bins = _build_10s_bins(times)
     n_bins = len(bins)
     if n_bins == 0:
-        return
+        return {}, [], [], [], []
 
     # Discover body-length and body-width keys
     sample_keys = list(track_arrays[0].keys()) if 0 in track_arrays else []
@@ -537,16 +464,15 @@ def _write_oncoplot(track_arrays, times, sleap_idxs, track_names,
         sample_keys, ['hip_l', 'hl'], ['hip_r', 'hr'])
 
     # ---- Build row specs: (label, key_or_func, norm_type) ----
-    # norm_type: 'minmax', 'p90', 'heading', 'direct'
     section1 = [
         ('Speed',       f'{bp}_speed',   'minmax'),
         ('Speed Accel', 'speed_accel',   'minmax'),
         ('|Jerk|',      f'{bp}_jerk',    'minmax_abs'),
     ]
     section2 = [
-        ('Speed p90%',       f'{bp}_speed',   'p90'),
-        ('Speed Accel p90%', 'speed_accel',   'p90'),
-        ('|Jerk| p90%',      f'{bp}_jerk',    'p90_abs'),
+        ('Speed p95%',       f'{bp}_speed',   'p95'),
+        ('Speed Accel p95%', 'speed_accel',   'p95'),
+        ('|Jerk| p95%',      f'{bp}_jerk',    'p95_abs'),
     ]
     section3 = []
     if body_len_key:
@@ -579,22 +505,18 @@ def _write_oncoplot(track_arrays, times, sleap_idxs, track_names,
     n_tracks = len(track_names)
 
     # ---- Pre-extract raw bin means per track per row ----
-    # raw_vals[row_idx][t_idx] = (n_bins,) array of bin means
     raw_vals = [[None] * n_tracks for _ in range(n_rows)]
 
     for t_idx in range(n_tracks):
         ta = track_arrays[t_idx]
         for r_idx, (label, key, ntype) in enumerate(all_rows):
             if key == '__heading__':
-                vx_arr = ta.get(f'{bp}_vx')
-                vy_arr = ta.get(f'{bp}_vy')
-                if vx_arr is not None and vy_arr is not None:
-                    vx_full = vx_arr[sleap_idxs].astype(float)
-                    vy_full = vy_arr[sleap_idxs].astype(float)
-                    hdg = np.degrees(np.arctan2(vy_full, vx_full)) % 360.0
+                hdg_arr = ta.get('body_heading_deg')
+                if hdg_arr is not None:
+                    hdg = hdg_arr[sleap_idxs].astype(float) % 360.0
                 else:
                     hdg = np.full(len(sleap_idxs), np.nan)
-                bin_means = np.array([np.nanmean(hdg[b]) if len(b) else np.nan
+                bin_means = np.array([_circular_mean_360(hdg[b]) if len(b) else np.nan
                                       for b in bins])
                 raw_vals[r_idx][t_idx] = bin_means
                 continue
@@ -607,14 +529,14 @@ def _write_oncoplot(track_arrays, times, sleap_idxs, track_names,
             full = src[sleap_idxs].astype(float)
             if 'abs' in ntype:
                 full = np.abs(full)
-            bin_means = np.array([np.nanmean(full[b]) if len(b) else np.nan
-                                  for b in bins])
+            with np.errstate(invalid='ignore'):
+                bin_means = np.array([np.nanmean(full[b]) if len(b) else np.nan
+                                      for b in bins])
 
-            # For p90 types, also need session-level p90
-            if ntype.startswith('p90'):
+            if ntype.startswith('p95'):
                 fin = full[np.isfinite(full)]
-                sess_p90 = float(np.percentile(fin, 90)) if len(fin) else 1.0
-                raw_vals[r_idx][t_idx] = (bin_means, sess_p90)
+                sess_p95 = float(np.percentile(fin, 95)) if len(fin) else 1.0
+                raw_vals[r_idx][t_idx] = (bin_means, sess_p95)
             else:
                 raw_vals[r_idx][t_idx] = bin_means
 
@@ -630,65 +552,90 @@ def _write_oncoplot(track_arrays, times, sleap_idxs, track_names,
                 global_stats[r_idx] = (float(np.min(fin)), float(np.max(fin)))
             else:
                 global_stats[r_idx] = (0.0, 1.0)
-        elif ntype in ('p90', 'p90_abs'):
-            # Use the max session_p90 across tracks for consistency
-            p90s = []
+        elif ntype in ('p95', 'p95_abs'):
+            p95s = []
             for t in range(n_tracks):
                 v = raw_vals[r_idx][t]
                 if v is not None and isinstance(v, tuple):
-                    p90s.append(v[1])
-            global_stats[r_idx] = max(p90s) if p90s else 1.0
+                    p95s.append(v[1])
+            global_stats[r_idx] = max(p95s) if p95s else 1.0
 
-    # ---- Render one page per animal ----
+    # ---- Build normalised matrices per track ----
     row_labels = [r[0] for r in all_rows]
+    matrix_per_track = {}
+
+    for t_idx in range(n_tracks):
+        matrix = np.full((n_rows, n_bins), np.nan)
+
+        for r_idx, (label, key, ntype) in enumerate(all_rows):
+            vals = raw_vals[r_idx][t_idx]
+            if vals is None:
+                continue
+
+            if ntype in ('minmax', 'minmax_abs'):
+                gmin, gmax = global_stats[r_idx]
+                matrix[r_idx] = _norm_minmax(vals, gmin, gmax)
+            elif ntype in ('p95', 'p95_abs'):
+                bm = vals[0] if isinstance(vals, tuple) else vals
+                sess_p95 = global_stats[r_idx]
+                matrix[r_idx] = _norm_p95(bm, sess_p95)
+            elif ntype == 'heading':
+                matrix[r_idx] = np.clip(vals / 360.0, 0.0, 1.0)
+            elif ntype == 'direct':
+                matrix[r_idx] = np.clip(vals, 0.0, 1.0)
+
+        matrix_per_track[t_idx] = matrix
+
+    return matrix_per_track, row_labels, section_breaks, global_stats, raw_vals
+
+
+def _write_oncoplot(track_arrays, times, sleap_idxs, track_names,
+                    node_names, fps, pdf_path, status_cb, show_values=True):
+    """Per-animal feature oncoplot: rows = features (4 sections), cols = 10s bins."""
+    if status_cb:
+        status_cb("Graphs: feature oncoplot\u2026")
+
+    result = _compute_oncoplot_matrix(
+        track_arrays, times, sleap_idxs, track_names, node_names, fps)
+    matrix_per_track, row_labels, section_breaks, global_stats, raw_vals = result
+
+    if not matrix_per_track:
+        return
+
+    n_bins = next(iter(matrix_per_track.values())).shape[1]
 
     with PdfPages(pdf_path) as pdf_out:
         for t_idx, tname in enumerate(track_names):
-            matrix = np.full((n_rows, n_bins), np.nan)
-
-            for r_idx, (label, key, ntype) in enumerate(all_rows):
-                vals = raw_vals[r_idx][t_idx]
-                if vals is None:
-                    continue
-
-                if ntype in ('minmax', 'minmax_abs'):
-                    gmin, gmax = global_stats[r_idx]
-                    matrix[r_idx] = _norm_minmax(vals, gmin, gmax)
-                elif ntype in ('p90', 'p90_abs'):
-                    bm = vals[0] if isinstance(vals, tuple) else vals
-                    sess_p90 = global_stats[r_idx]
-                    matrix[r_idx] = _norm_p90(bm, sess_p90)
-                elif ntype == 'heading':
-                    # [0, 360] → [0, 1]
-                    matrix[r_idx] = np.clip(vals / 360.0, 0.0, 1.0)
-                elif ntype == 'direct':
-                    matrix[r_idx] = np.clip(vals, 0.0, 1.0)
-
+            matrix = matrix_per_track[t_idx]
+            _sv = show_values and (n_bins <= 40)
             _render_oncoplot(matrix, row_labels, section_breaks, times,
                              f"Feature Profile \u2014 {tname}", pdf_out,
-                             show_values=(n_bins <= 40))
+                             show_values=_sv, compact=(not show_values))
 
 
 # ---------------------------------------------------------------------------
 # 5. Synchrony Oncoplot
 # ---------------------------------------------------------------------------
 
-def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
-                         fps, pdf_path, status_cb):
-    """Combined synchrony oncoplot: one page with all pair metrics."""
-    if status_cb:
-        status_cb("Graphs: synchrony oncoplot\u2026")
+def _compute_sync_matrix(pair_arrays, times, sleap_idxs, track_names, fps):
+    """Compute synchrony oncoplot matrix without rendering.
 
+    Returns
+    -------
+    matrix : ndarray  (n_rows, n_bins) normalised
+    row_labels : list[str]
+    section_breaks : list[int]
+    raw : ndarray  (n_rows, n_bins) un-normalised bin means
+    """
     n_tracks = len(track_names)
     if n_tracks < 2:
-        return
+        return np.empty((0, 0)), [], [], np.empty((0, 0))
 
     bins = _build_10s_bins(times)
     n_bins = len(bins)
     if n_bins == 0:
-        return
+        return np.empty((0, 0)), [], [], np.empty((0, 0))
 
-    # Row specs per pair: (label_template, key_suffix, norm_type)
     row_specs = [
         ('Cov X',        'pos_covariance_x',  'minmax'),
         ('Cov Y',        'pos_covariance_y',  'minmax'),
@@ -702,7 +649,6 @@ def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
     n_rows_per_pair = len(row_specs)
     n_rows = len(pairs) * n_rows_per_pair
 
-    # ---- Extract bin means ----
     raw = np.full((n_rows, n_bins), np.nan)
     row_labels = []
     row_norms = []
@@ -725,12 +671,10 @@ def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
             row_norms.append(ntype)
             r += 1
 
-    # ---- Compute global min/max for minmax rows ----
-    # Group by suffix to share scale across pairs
+    # Global min/max grouped by metric name across pairs
     minmax_groups = {}
     for r_idx, ntype in enumerate(row_norms):
         if ntype == 'minmax':
-            # Extract suffix from label
             suffix_key = row_labels[r_idx].split(' (')[0]
             minmax_groups.setdefault(suffix_key, []).append(r_idx)
 
@@ -743,7 +687,6 @@ def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
         else:
             global_ranges[grp_key] = (0.0, 1.0)
 
-    # ---- Normalise ----
     matrix = np.full((n_rows, n_bins), np.nan)
     for r_idx in range(n_rows):
         ntype = row_norms[r_idx]
@@ -754,13 +697,30 @@ def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
             gmin, gmax = global_ranges[grp_key]
             matrix[r_idx] = _norm_minmax(raw[r_idx], gmin, gmax)
 
-    # Section breaks between pairs
     section_breaks = [i * n_rows_per_pair for i in range(1, len(pairs))]
 
+    return matrix, row_labels, section_breaks, raw
+
+
+def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
+                         fps, pdf_path, status_cb, show_values=True):
+    """Combined synchrony oncoplot: one page with all pair metrics."""
+    if status_cb:
+        status_cb("Graphs: synchrony oncoplot\u2026")
+
+    matrix, row_labels, section_breaks, raw = _compute_sync_matrix(
+        pair_arrays, times, sleap_idxs, track_names, fps)
+
+    if matrix.size == 0:
+        return
+
+    n_bins = matrix.shape[1]
+
     with PdfPages(pdf_path) as pdf_out:
+        _sv = show_values and (n_bins <= 40)
         _render_oncoplot(matrix, row_labels, section_breaks, times,
                          "Synchrony Profile", pdf_out,
-                         show_values=(n_bins <= 40))
+                         show_values=_sv, compact=(not show_values))
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +729,8 @@ def _write_sync_oncoplot(pair_arrays, times, sleap_idxs, track_names,
 
 def write_graphs(zone_summary_df, track_arrays, pair_arrays, frame_map,
                  track_names, node_names, fps, base_path, status_cb=None,
-                 arena_cm=40, strip_cm=8, px_per_cm=1.0, arena_snapshot=None):
+                 arena_cm=40, strip_cm=8, px_per_cm=1.0, arena_snapshot=None,
+                 graph_opts=None):
     """
     Generate all graph PDF files (5 PDFs, generated in parallel).
 
@@ -792,11 +753,16 @@ def write_graphs(zone_summary_df, track_arrays, pair_arrays, frame_map,
     strip_cm        : int — border strip width in cm
     px_per_cm       : float — pixels per centimetre
     arena_snapshot  : ndarray or None — RGB image of arena cropped to ROI
+    graph_opts      : dict[str,bool] or None — keys like 'graph_heatmaps',
+                      'graph_cascade', etc.  None means generate all graphs.
 
     Returns
     -------
     list[str]  Paths of files that were written.
     """
+    def _want(key: str) -> bool:
+        return graph_opts.get(key, True) if graph_opts else True
+
     bp_dir = Path(base_path)
     stem   = bp_dir.stem
     outdir = bp_dir.parent
@@ -808,31 +774,48 @@ def write_graphs(zone_summary_df, track_arrays, pair_arrays, frame_map,
     def _path(suffix):
         return str(outdir / f"{stem}{suffix}")
 
-    # Define the five PDF tasks
+    # Define PDF tasks — only add tasks the user selected
     tasks = {}
 
-    p_heat = _path("_graphs_heatmaps.pdf")
-    tasks[p_heat] = lambda p=p_heat: _write_heatmaps(
-        zone_summary_df, track_names, p, status_cb,
-        arena_cm=arena_cm, strip_cm=strip_cm, arena_snapshot=arena_snapshot)
+    if _want('graph_heatmaps'):
+        p_heat = _path("_graphs_heatmaps.pdf")
+        tasks[p_heat] = lambda p=p_heat: _write_heatmaps(
+            zone_summary_df, track_names, p, status_cb,
+            arena_cm=arena_cm, strip_cm=strip_cm, arena_snapshot=arena_snapshot)
 
-    p_cascade = _path("_graphs_cascade.pdf")
-    tasks[p_cascade] = lambda p=p_cascade: _write_cascade_plot(
-        track_arrays, times, sleap_idxs, track_names, node_names, p, status_cb)
+    if _want('graph_cascade'):
+        p_cascade = _path("_graphs_cascade.pdf")
+        tasks[p_cascade] = lambda p=p_cascade: _write_cascade_plot(
+            track_arrays, times, sleap_idxs, track_names, node_names, p, status_cb)
 
-    p_dist = _path("_graphs_distance.pdf")
-    tasks[p_dist] = lambda p=p_dist: _write_distance_plot(
-        pair_arrays, times, sleap_idxs, track_names, p, status_cb,
-        px_per_cm=px_per_cm)
+    if _want('graph_distance'):
+        p_dist = _path("_graphs_distance.pdf")
+        tasks[p_dist] = lambda p=p_dist: _write_distance_plot(
+            pair_arrays, times, sleap_idxs, track_names, p, status_cb,
+            px_per_cm=px_per_cm)
 
-    p_onco = _path("_graphs_oncoplot.pdf")
-    tasks[p_onco] = lambda p=p_onco: _write_oncoplot(
-        track_arrays, times, sleap_idxs, track_names, node_names,
-        fps, p, status_cb)
+    if _want('graph_oncoplot'):
+        p_onco = _path("_graphs_oncoplot.pdf")
+        tasks[p_onco] = lambda p=p_onco: _write_oncoplot(
+            track_arrays, times, sleap_idxs, track_names, node_names,
+            fps, p, status_cb)
 
-    p_sync = _path("_graphs_sync_oncoplot.pdf")
-    tasks[p_sync] = lambda p=p_sync: _write_sync_oncoplot(
-        pair_arrays, times, sleap_idxs, track_names, fps, p, status_cb)
+    if _want('graph_sync_oncoplot'):
+        p_sync = _path("_graphs_sync_oncoplot.pdf")
+        tasks[p_sync] = lambda p=p_sync: _write_sync_oncoplot(
+            pair_arrays, times, sleap_idxs, track_names, fps, p, status_cb)
+
+    if _want('graph_oncoplot_clean'):
+        p_onco_c = _path("_graphs_oncoplot_clean.pdf")
+        tasks[p_onco_c] = lambda p=p_onco_c: _write_oncoplot(
+            track_arrays, times, sleap_idxs, track_names, node_names,
+            fps, p, status_cb, show_values=False)
+
+    if _want('graph_sync_oncoplot_clean'):
+        p_sync_c = _path("_graphs_sync_oncoplot_clean.pdf")
+        tasks[p_sync_c] = lambda p=p_sync_c: _write_sync_oncoplot(
+            pair_arrays, times, sleap_idxs, track_names, fps, p, status_cb,
+            show_values=False)
 
     written = []
 

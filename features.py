@@ -43,11 +43,8 @@ def _cm_pos(tracks, body_idx, t):
 
 
 def _heading_deg(tracks, kin, body_idx, t):
-    """CM heading in degrees for one track."""
-    if body_idx is not None:
-        h = kin['heading_deg'][:, body_idx, t].astype(np.float64)
-    else:
-        h = np.nanmean(kin['heading_deg'][:, :, t], axis=1).astype(np.float64)
+    """Body-axis heading in degrees for one track."""
+    h = kin['body_heading_deg'][:, t].astype(np.float64)
     return np.nan_to_num(h, nan=0.0)
 
 
@@ -212,11 +209,11 @@ def _hourglass_triangles(tracks, node_names, t):
     Returns (upper, lower) each (n_frames,). NaN where required nodes missing.
     """
     n_frames = tracks.shape[0]
-    cm_idx  = find_node_idx(node_names, 'center', 'body', 'cm', 'centroid')
-    el_idx  = find_node_idx(node_names, 'ear_l', 'el')
-    er_idx  = find_node_idx(node_names, 'ear_r', 'er')
-    hl_idx  = find_node_idx(node_names, 'hip_l', 'hl')
-    hr_idx  = find_node_idx(node_names, 'hip_r', 'hr')
+    cm_idx  = find_node_idx(node_names, 'body')
+    el_idx  = find_node_idx(node_names, 'ear_l')
+    er_idx  = find_node_idx(node_names, 'ear_r')
+    hl_idx  = find_node_idx(node_names, 'hip_l')
+    hr_idx  = find_node_idx(node_names, 'hip_r')
 
     nan_arr = np.full(n_frames, np.nan)
 
@@ -367,7 +364,7 @@ def _pair_features(tracks, kin, node_names, fps):
     if n_tracks < 2:
         return {}
 
-    body_idx = find_node_idx(node_names, 'center', 'body', 'cm', 'centroid')
+    body_idx = find_node_idx(node_names, 'body')
     out = {}
 
     for tA, tB in combinations(range(n_tracks), 2):
@@ -376,8 +373,8 @@ def _pair_features(tracks, kin, node_names, fps):
         cm_A = _cm_pos(tracks, body_idx, tA)
         cm_B = _cm_pos(tracks, body_idx, tB)
 
-        hdg_A = _smooth_heading_from_pos(cm_A)
-        hdg_B = _smooth_heading_from_pos(cm_B)
+        hdg_A = kin['body_heading_deg'][:, tA]
+        hdg_B = kin['body_heading_deg'][:, tB]
 
         # --- Inter-animal distance & displacement ---
         inter = np.hypot(cm_A[:, 0] - cm_B[:, 0], cm_A[:, 1] - cm_B[:, 1])
@@ -428,7 +425,8 @@ def _pair_features(tracks, kin, node_names, fps):
         vxB = np.gradient(cm_B[:, 0]); vyB = np.gradient(cm_B[:, 1])
         dot = vxA * vxB + vyA * vyB
         mag = np.hypot(vxA, vyA) * np.hypot(vxB, vyB)
-        out[f'{pfx}/velocity_cos_sim'] = np.where(mag > 1e-12, dot / mag, 0.0)
+        safe_mag = np.where(mag > 1e-12, mag, 1.0)
+        out[f'{pfx}/velocity_cos_sim'] = np.where(mag > 1e-12, dot / safe_mag, 0.0)
 
         # --- Visual scope (A sees B, B sees A) ---
         # Binocular < 20°, Monocular < 120°, None otherwise
@@ -473,7 +471,7 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
         't{A}_t{B}/feature_name' -> (n_frames,) array
     """
     n_frames, _, n_nodes, n_tracks = tracks.shape
-    body_idx = find_node_idx(node_names, 'center', 'body', 'cm', 'centroid')
+    body_idx = find_node_idx(node_names, 'body')
 
     track_arrays = {}
     for t in range(n_tracks):
@@ -518,6 +516,7 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
         body_spd = (kin['speed'][:, body_idx, t] if body_idx is not None
                     else np.nanmean(kin['speed'][:, :, t], axis=1))
         fa['speed_accel'] = _speed_accel(body_spd, fps)
+        fa['body_heading_deg'] = kin['body_heading_deg'][:, t]
 
         fa['cm_total_disp'] = (node_disp[body_idx] if body_idx is not None
                                else np.mean([node_disp[n] for n in range(n_nodes)], axis=0))

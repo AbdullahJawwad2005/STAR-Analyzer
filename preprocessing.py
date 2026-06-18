@@ -6,16 +6,7 @@ from pykalman import KalmanFilter
 
 
 def _kalman_fill_gap(trace, gap_start, gap_end, fps):
-    """Run Kalman smoother on a local window around a NaN gap, writing back only to NaN positions.
-
-    This is a constant-velocity 2-state Kalman model (state = [position, velocity]).
-    It is used here because NaN gaps in SLEAP pose estimation are typically caused by
-    brief occlusions of the animal — the animal does not stop moving during occlusion.
-    A Kalman smoother with a constant-velocity prior respects the inertia of movement
-    (i.e. the animal likely kept going in roughly the same direction at roughly the same
-    speed) better than pure spline or linear interpolation, which have no physical prior
-    about trajectory continuity.
-    """
+    """Run Kalman smoother on a local window around a NaN gap, writing back only to NaN positions."""
     context = max(int(fps * 1.5), (gap_end - gap_start + 1) * 2)
     win_s = max(0, gap_start - context)
     win_e = min(len(trace), gap_end + 1 + context)
@@ -32,12 +23,7 @@ def _kalman_fill_gap(trace, gap_start, gap_end, fps):
         observation_covariance=np.eye(1) * 1e-2,
         initial_state_mean=[float(finite_vals[0]), 0],
     )
-    # pykalman requires a masked array so it knows which observations are
-    # missing (NaN).  Passing a plain ndarray with NaN values causes the
-    # smoother to treat them as valid zero-ish observations and return
-    # all-NaN smoothed means, causing long gaps to fall through to the
-    # linear-interpolation fallback without ever using the Kalman smoother.
-    smoothed_means, _ = kf.smooth(np.ma.masked_invalid(window))
+    smoothed_means, _ = kf.smooth(window)
 
     for i in range(gap_start, gap_end + 1):
         if np.isnan(trace[i]):
@@ -45,27 +31,6 @@ def _kalman_fill_gap(trace, gap_start, gap_end, fps):
 
 
 def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
-    """Fill NaN gaps in a single 1-D coordinate trace using a three-tier strategy.
-
-    The tiers are applied in order; each tier handles gaps the previous tier left unfilled:
-
-    Tier 1 — Short gaps (length <= fps * 0.25 s, default ~6 frames at 24 fps):
-        PCHIP spline interpolation (Piecewise Cubic Hermite Interpolating Polynomial).
-        PCHIP is shape-preserving and respects the gradient (slope) at the gap boundaries,
-        so it produces smooth, physically plausible trajectories without the oscillation
-        risk of a standard cubic spline.  It is the first choice for brief occlusions.
-
-    Tier 2 — Longer gaps (those skipped by Tier 1):
-        Kalman smoother on a local context window around the gap (_kalman_fill_gap).
-        For gaps too long for reliable spline extrapolation, the constant-velocity Kalman
-        prior gives a more defensible estimate than a polynomial that may overshoot.
-
-    Tier 3 — Last-resort fallback (any NaNs still remaining after Tier 1 + 2):
-        Linear interpolation (np.interp) between the nearest finite neighbours, followed
-        by constant-pad from the first / last valid value to fill leading/trailing NaNs.
-        This is purely a safety net for edge cases (e.g. NaNs at the very start or end
-        of the trace where PCHIP and Kalman have no context).
-    """
     trace = np.asarray(trace, dtype=np.float32)
 
     if np.all(np.isnan(trace)):
@@ -131,7 +96,7 @@ def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
     return filled
 
 
-def smooth_sleap_allnodes(coords, med_win=3, sg_win=5, poly=2):
+def smooth_sleap_allnodes(coords, med_win=3, sg_win=5, poly=3):
     coords = np.asarray(coords, dtype=float)
     smoothed = np.copy(coords)
 
@@ -148,12 +113,6 @@ def smooth_sleap_allnodes(coords, med_win=3, sg_win=5, poly=2):
             d = smoothed[:, node_idx, axis]
 
             if med_win > 1:
-                # Median filter first to remove spike noise (single-frame outliers).
-                # This step is critical because Savitzky-Golay (below) assumes
-                # additive Gaussian noise — its polynomial fit is a least-squares
-                # estimator that is highly sensitive to outliers.  A single large
-                # spike corrupts the fit across the entire SG window.  The median
-                # filter neutralises spikes before SG sees the data.
                 d = median_filter(d, size=med_win)
 
             if sg_win >= 3 and len(d) >= sg_win:
@@ -164,27 +123,172 @@ def smooth_sleap_allnodes(coords, med_win=3, sg_win=5, poly=2):
     return smoothed
 
 
-def compute_kinematics(tracks, fps, sg_win=11, sg_poly=3):
+def _smooth_body_axis_heading(front, rear, fps, sg_win, sg_poly):
+    """Body-axis heading from rear→front anatomical landmarks.
+
+    Parameters
+    ----------
+    front, rear : (n_frames, 2) arrays — x, y positions of front/rear landmarks
+    fps         : float
+    sg_win      : int   Savitzky-Golay window (odd)
+    sg_poly     : int   polynomial order
+
+    Returns
+    -------
+    (n_frames,) heading in degrees [-180, 180]
+    """
+    dx = front[:, 0] - rear[:, 0]
+    dy = front[:, 1] - rear[:, 1]
+    raw_deg = np.degrees(np.arctan2(dy, dx))
+
+    # Mark degenerate frames (front≈rear, distance < 1 px) for interpolation
+    dist = np.hypot(dx, dy)
+    bad = dist < 1.0
+
+    if np.all(bad):
+        return np.zeros(len(front), dtype=np.float64)
+
+    # Convert to sin/cos, interpolate bad frames, convert back
+    sin_h = np.sin(np.radians(raw_deg))
+    cos_h = np.cos(np.radians(raw_deg))
+    if np.any(bad):
+        good = ~bad
+        x_ax = np.arange(len(raw_deg))
+        sin_h[bad] = np.interp(x_ax[bad], x_ax[good], sin_h[good])
+        cos_h[bad] = np.interp(x_ax[bad], x_ax[good], cos_h[good])
+    filled_deg = np.degrees(np.arctan2(sin_h, cos_h))
+
+    # Unwrap → smooth → rewrap
+    unwrapped = np.unwrap(np.radians(filled_deg))
+    n = len(unwrapped)
+    w = sg_win
+    if w % 2 == 0:
+        w += 1
+    w = max(w, sg_poly + 2)
+    if w % 2 == 0:
+        w += 1
+    max_w = n if n % 2 == 1 else n - 1
+    w = min(w, max_w)
+    p = min(sg_poly, w - 1)
+    if w >= 3 and n >= w:
+        smoothed = savgol_filter(unwrapped, w, p)
+    else:
+        smoothed = unwrapped
+    result = np.degrees(smoothed)
+    result = (result + 180.0) % 360.0 - 180.0
+    return result.astype(np.float64)
+
+
+def _compute_body_heading(tracks, fps, sg_win, sg_poly, node_names):
+    """Compute body-axis heading for all tracks.
+
+    Fallback chain for front/rear landmark pairs:
+      1. body → nose
+      2. hip_mid → ear_mid
+      3. hip_mid → nose
+      4. velocity heading (last resort)
+
+    Parameters
+    ----------
+    tracks     : (n_frames, 2, n_nodes, n_tracks)
+    fps        : float
+    sg_win     : int   — base SG window (widened internally for heading)
+    sg_poly    : int
+    node_names : list[str] or None
+
+    Returns
+    -------
+    (n_frames, n_tracks) heading in degrees [-180, 180]
+    """
+    from behaviors import find_node_idx
+
+    # Body-axis heading needs a wider smoothing window than velocity derivatives
+    # because arctan2 of landmark pairs amplifies per-pixel tracking jitter.
+    # Use ~375 ms at 24 fps (9 frames) as minimum, or 3× the base window.
+    hdg_win = max(sg_win * 3, 9)
+    if hdg_win % 2 == 0:
+        hdg_win += 1
+
+    n_frames, _, n_nodes, n_tracks = tracks.shape
+    result = np.zeros((n_frames, n_tracks), dtype=np.float64)
+
+    # Resolve node indices
+    if node_names is not None:
+        body_idx = find_node_idx(node_names, 'body')
+        nose_idx = find_node_idx(node_names, 'nose')
+        ear_l_idx = find_node_idx(node_names, 'ear_l')
+        ear_r_idx = find_node_idx(node_names, 'ear_r')
+        hip_l_idx = find_node_idx(node_names, 'hip_l')
+        hip_r_idx = find_node_idx(node_names, 'hip_r')
+    else:
+        body_idx = nose_idx = ear_l_idx = ear_r_idx = hip_l_idx = hip_r_idx = None
+
+    for t in range(n_tracks):
+        front = rear = None
+
+        # Chain 1: body → nose
+        if body_idx is not None and nose_idx is not None:
+            rear = np.stack([tracks[:, 0, body_idx, t],
+                             tracks[:, 1, body_idx, t]], axis=1)
+            front = np.stack([tracks[:, 0, nose_idx, t],
+                              tracks[:, 1, nose_idx, t]], axis=1)
+
+        # Chain 2: hip_mid → ear_mid
+        if front is None and (hip_l_idx is not None and hip_r_idx is not None
+                              and ear_l_idx is not None and ear_r_idx is not None):
+            rear = np.stack([
+                (tracks[:, 0, hip_l_idx, t] + tracks[:, 0, hip_r_idx, t]) / 2.0,
+                (tracks[:, 1, hip_l_idx, t] + tracks[:, 1, hip_r_idx, t]) / 2.0,
+            ], axis=1)
+            front = np.stack([
+                (tracks[:, 0, ear_l_idx, t] + tracks[:, 0, ear_r_idx, t]) / 2.0,
+                (tracks[:, 1, ear_l_idx, t] + tracks[:, 1, ear_r_idx, t]) / 2.0,
+            ], axis=1)
+
+        # Chain 3: hip_mid → nose
+        if front is None and (hip_l_idx is not None and hip_r_idx is not None
+                              and nose_idx is not None):
+            rear = np.stack([
+                (tracks[:, 0, hip_l_idx, t] + tracks[:, 0, hip_r_idx, t]) / 2.0,
+                (tracks[:, 1, hip_l_idx, t] + tracks[:, 1, hip_r_idx, t]) / 2.0,
+            ], axis=1)
+            front = np.stack([tracks[:, 0, nose_idx, t],
+                              tracks[:, 1, nose_idx, t]], axis=1)
+
+        if front is not None and rear is not None:
+            result[:, t] = _smooth_body_axis_heading(front, rear, fps, hdg_win, sg_poly)
+        else:
+            # Fallback: velocity heading from body-center (or mean of all nodes)
+            if body_idx is not None:
+                vx = np.gradient(tracks[:, 0, body_idx, t])
+                vy = np.gradient(tracks[:, 1, body_idx, t])
+            else:
+                vx = np.gradient(np.nanmean(tracks[:, 0, :, t], axis=1))
+                vy = np.gradient(np.nanmean(tracks[:, 1, :, t], axis=1))
+            result[:, t] = np.degrees(np.arctan2(vy, vx))
+
+    return result
+
+
+def compute_kinematics(tracks, fps, sg_win=3, sg_poly=3, node_names=None):
     """
     Compute per-frame kinematics for all tracks/nodes via Savitzky-Golay differentiation.
 
     Parameters
     ----------
-    tracks  : np.ndarray  shape (n_frames, 2, n_nodes, n_tracks)  — already filled/smoothed
-    fps     : float
-    sg_win  : int   window length (odd; must satisfy window > deriv and >= poly+1)
-    sg_poly : int   polynomial order (>= 3 to support jerk; default 3)
+    tracks     : np.ndarray  shape (n_frames, 2, n_nodes, n_tracks)  — already filled/smoothed
+    fps        : float
+    sg_win     : int   window length (odd; must satisfy window > deriv and >= poly+1)
+    sg_poly    : int   polynomial order (>= 3 to support jerk; default 3)
+    node_names : list[str] or None — needed for body-axis heading computation
 
     Returns
     -------
-    dict of np.ndarrays, each shape (n_frames, n_nodes, n_tracks):
-        vx, vy          — velocity components  (px/s)
-        speed           — speed magnitude       (px/s)
-        heading_deg     — movement heading via arctan2(vy, vx)  (degrees, -180..180)
-        ax, ay          — acceleration components  (px/s²)
-        accel           — acceleration magnitude
-        jx, jy          — jerk components      (px/s³)
-        jerk            — jerk magnitude
+    dict of np.ndarrays:
+        Per-node (n_frames, n_nodes, n_tracks):
+            vx, vy, speed, heading_deg, ax, ay, accel, jx, jy, jerk
+        Per-track (n_frames, n_tracks):
+            body_heading_deg — body-axis heading from rear→front landmarks
     """
     tracks = np.asarray(tracks, dtype=np.float32)
     n_frames, _, n_nodes, n_tracks = tracks.shape
@@ -212,16 +316,6 @@ def compute_kinematics(tracks, fps, sg_win=11, sg_poly=3):
         for n in range(n_nodes):
             x = tracks[:, 0, n, t]
             y = tracks[:, 1, n, t]
-            # Savitzky-Golay with the deriv= argument is used for differentiation
-            # rather than finite differences (e.g. np.gradient).  SG fits a local
-            # polynomial to the data window and then analytically differentiates
-            # that polynomial — so the derivative is exact with respect to the fit
-            # and does NOT amplify high-frequency noise.  By contrast, np.gradient
-            # is essentially a finite-difference operator: dividing adjacent position
-            # differences by dt magnifies any residual noise by 1/dt, which is large
-            # at video frame rates (e.g. 1/0.042 ≈ 24 at 24 fps).  The SG approach
-            # gives smooth, physically meaningful velocity and acceleration estimates
-            # without a separate smoothing pass after differentiation.
             vx[:, n, t] = savgol_filter(x, sg_win, sg_poly, deriv=1, delta=dt)
             vy[:, n, t] = savgol_filter(y, sg_win, sg_poly, deriv=1, delta=dt)
             ax[:, n, t] = savgol_filter(x, sg_win, sg_poly, deriv=2, delta=dt)
@@ -235,10 +329,13 @@ def compute_kinematics(tracks, fps, sg_win=11, sg_poly=3):
     accel   = np.hypot(ax, ay)
     jerk    = np.hypot(jx, jy)
 
+    body_heading = _compute_body_heading(tracks, fps, sg_win, sg_poly, node_names)
+
     return {
         "vx": vx, "vy": vy, "speed": speed, "heading_deg": heading,
         "ax": ax, "ay": ay, "accel": accel,
         "jx": jx, "jy": jy, "jerk": jerk,
+        "body_heading_deg": body_heading,
     }
 
 
@@ -262,13 +359,7 @@ def fill_and_smooth_tracks(tracks, fps, med_win=3, sg_win=5, poly=2, progress_ca
     step = 0
 
     for track_idx in range(n_tracks):
-        # Axis transposition explanation:
-        # The app-wide array layout is (n_frames, 2, n_nodes) — axis 1 is x/y, axis 2 is node index.
-        # The fill and smooth helpers (hybrid_convergent_fill, smooth_sleap_allnodes) expect
-        # (n_frames, n_nodes, 2) — axis 1 is node index, axis 2 is x/y.
-        # transpose(0, 2, 1) swaps axes 1 and 2, converting between the two conventions.
-        # The inverse transpose (also 0, 2, 1) is applied after processing to restore the
-        # original layout before writing back into `processed`.
+        # Convert one track to old format: (frames, nodes, 2)
         coords = processed[:, :, :, track_idx].transpose(0, 2, 1)
 
         for node_idx in range(n_nodes):
