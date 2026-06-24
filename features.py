@@ -319,17 +319,11 @@ def _position_entropy(cm_x, cm_y, roi, n_bins=10):
     Normalised Shannon entropy of spatial occupancy (session-level scalar).
     0 = always in one cell; 1 = perfectly uniform.
 
-    Important — this is a SESSION-LEVEL scalar, not a time-varying quantity:
     The 2D arena ROI is divided into a 10 x 10 grid of cells (100 cells total).
     Shannon entropy of the occupancy histogram is computed once over the entire
     session and normalised by log2(100) so the result is in [0, 1].
     The single scalar is then broadcast to ALL frames via np.full(n_frames, ent),
     so every frame in the export will carry the same entropy value for a given track.
-    In the binned export, every bin will therefore have the same entropy column value.
-    This is intentional — position_entropy is a global summary statistic that
-    characterises the animal's space-use diversity for the whole session, not a
-    moment-by-moment measure.  Use dist_roi_center / dist_roi_boundary for
-    time-varying spatial context.
     """
     if roi is None:
         return np.nan
@@ -529,6 +523,198 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
 
     pair_arrays = _pair_features(tracks, kin, node_names, fps)
     return track_arrays, pair_arrays
+
+
+# ---------------------------------------------------------------------------
+# Key Metrics summary (one-glance overview sheet)
+# ---------------------------------------------------------------------------
+
+def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
+                         track_arrays, pair_arrays, frame_map,
+                         zone_summary_df, node_names, track_names,
+                         fps, px_per_cm):
+    """
+    Build a long-format DataFrame with essential behavioural summary metrics.
+
+    Columns: Category, Metric, Subject, Value, Unit
+    """
+    n_frames, _, n_nodes, n_tracks = tracks.shape
+    session_frames = len(frame_map)
+    session_dur = session_frames / fps  # seconds
+
+    body_idx = find_node_idx(node_names, 'body')
+    nose_idx = find_node_idx(node_names, 'nose')
+    ear_l_idx = find_node_idx(node_names, 'ear_l')
+    ear_r_idx = find_node_idx(node_names, 'ear_r')
+    tail_idx = find_node_idx(node_names, 'tail')
+
+    # Only use frames that are in the frame_map (valid sleap indices)
+    sleap_idxs = np.array(sorted(frame_map.values()))
+
+    rows = []
+
+    def _add(cat, metric, subject, value, unit):
+        rows.append(dict(Category=cat, Metric=metric, Subject=subject,
+                         Value=round(value, 4) if np.isfinite(value) else value,
+                         Unit=unit))
+
+    # ------------------------------------------------------------------
+    # Per-animal metrics
+    # ------------------------------------------------------------------
+    for t, tname in enumerate(track_names):
+        ta = track_arrays[t]
+
+        # Total distance (final cumulative displacement of body node, convert to cm)
+        total_disp_px = ta['cm_total_disp'][sleap_idxs[-1]] if len(sleap_idxs) else 0.0
+        _add('Locomotion', 'Total Distance Traveled', tname,
+             total_disp_px / px_per_cm, 'cm')
+
+        # Body speed stats (convert px/frame·fps → already in px/s via kin)
+        if body_idx is not None:
+            spd = kin['speed'][sleap_idxs, body_idx, t]
+        else:
+            spd = np.nanmean(kin['speed'][sleap_idxs, :, t], axis=1)
+        spd_cm = spd / px_per_cm
+        _add('Locomotion', 'Avg Speed', tname, float(np.nanmean(spd_cm)), 'cm/s')
+        _add('Locomotion', 'Median Speed', tname, float(np.nanmedian(spd_cm)), 'cm/s')
+        _add('Locomotion', 'P95 Speed', tname, float(np.nanpercentile(spd_cm, 95)), 'cm/s')
+
+        # Acceleration
+        if body_idx is not None:
+            acc = kin['accel'][sleap_idxs, body_idx, t]
+        else:
+            acc = np.nanmean(kin['accel'][sleap_idxs, :, t], axis=1)
+        _add('Locomotion', 'Avg Acceleration', tname,
+             float(np.nanmean(acc / px_per_cm)), 'cm/s²')
+
+        # Immobility
+        if 'stationary' in single_beh:
+            stat_frames = float(np.nansum(single_beh['stationary'][sleap_idxs, t]))
+            imm_time = stat_frames / fps
+            _add('Immobility', 'Immobility Time', tname, imm_time, 's')
+            _add('Immobility', 'Immobility %', tname,
+                 imm_time / session_dur * 100 if session_dur > 0 else 0.0, '%')
+
+        # Zone times from zone_summary_df
+        if zone_summary_df is not None and not zone_summary_df.empty:
+            track_zones = zone_summary_df[zone_summary_df['Track'] == tname]
+            # Center = Open zone
+            open_row = track_zones[track_zones['Zone'] == 'Open']
+            center_t = float(open_row['Time in Zone (s)'].sum()) if len(open_row) else 0.0
+            _add('Zone', 'Center Zone Time', tname, center_t, 's')
+            # Perimeter = W1-W4
+            wall_t = float(track_zones[track_zones['Zone'].isin(
+                ['W1','W2','W3','W4'])]['Time in Zone (s)'].sum())
+            _add('Zone', 'Perimeter Zone Time', tname, wall_t, 's')
+            # Corner = C1-C4
+            corner_t = float(track_zones[track_zones['Zone'].isin(
+                ['C1','C2','C3','C4'])]['Time in Zone (s)'].sum())
+            _add('Zone', 'Corner Zone Time', tname, corner_t, 's')
+
+    # ------------------------------------------------------------------
+    # Per-pair metrics (proximity & contact)
+    # ------------------------------------------------------------------
+    if n_tracks < 2:
+        return pd.DataFrame(rows, columns=['Category','Metric','Subject','Value','Unit'])
+
+    prox_thresh_cm = 3.0
+    contact_thresh_cm = 1.0
+    prox_thresh_px = prox_thresh_cm * px_per_cm
+    contact_thresh_px = contact_thresh_cm * px_per_cm
+
+    for tA in range(n_tracks):
+        for tB in range(tA + 1, n_tracks):
+            pair_name = f'{track_names[tA]} & {track_names[tB]}'
+            pfx = f't{tA}_t{tB}'
+
+            # Body-body distance (from pair_arrays)
+            inter_key = f'{pfx}/inter_animal_dist'
+            if inter_key in pair_arrays:
+                inter = pair_arrays[inter_key][sleap_idxs]
+            else:
+                # Fallback: compute from body node
+                cm_A = _cm_pos(tracks, body_idx, tA)[sleap_idxs]
+                cm_B = _cm_pos(tracks, body_idx, tB)[sleap_idxs]
+                inter = np.hypot(cm_A[:, 0] - cm_B[:, 0], cm_A[:, 1] - cm_B[:, 1])
+
+            def _node_pair_dist(idx_a, idx_b):
+                """Euclidean distance between node idx_a on tA and idx_b on tB."""
+                xa = tracks[sleap_idxs, 0, idx_a, tA]
+                ya = tracks[sleap_idxs, 1, idx_a, tA]
+                xb = tracks[sleap_idxs, 0, idx_b, tB]
+                yb = tracks[sleap_idxs, 1, idx_b, tB]
+                return np.hypot(xa - xb, ya - yb)
+
+            def _head_centroid(t_idx):
+                """Average of ear_l and ear_r positions; fall back to nose."""
+                if ear_l_idx is not None and ear_r_idx is not None:
+                    x = (tracks[sleap_idxs, 0, ear_l_idx, t_idx] +
+                         tracks[sleap_idxs, 0, ear_r_idx, t_idx]) / 2.0
+                    y = (tracks[sleap_idxs, 1, ear_l_idx, t_idx] +
+                         tracks[sleap_idxs, 1, ear_r_idx, t_idx]) / 2.0
+                    return x, y
+                if nose_idx is not None:
+                    return (tracks[sleap_idxs, 0, nose_idx, t_idx],
+                            tracks[sleap_idxs, 1, nose_idx, t_idx])
+                return None, None
+
+            # Build distance arrays for each node-pair type
+            dist_pairs = {}
+            dist_pairs['Body-Body'] = inter
+
+            if nose_idx is not None:
+                dist_pairs['Nose-Nose'] = _node_pair_dist(nose_idx, nose_idx)
+
+            hx_A, hy_A = _head_centroid(tA)
+            hx_B, hy_B = _head_centroid(tB)
+            if hx_A is not None and hx_B is not None:
+                dist_pairs['Head-Head'] = np.hypot(hx_A - hx_B, hy_A - hy_B)
+
+            if nose_idx is not None and body_idx is not None:
+                # min of (noseA→bodyB, noseB→bodyA)
+                d1 = _node_pair_dist(nose_idx, body_idx)
+                # Reverse: nose of tB to body of tA
+                xa = tracks[sleap_idxs, 0, nose_idx, tB]
+                ya = tracks[sleap_idxs, 1, nose_idx, tB]
+                xb = tracks[sleap_idxs, 0, body_idx, tA]
+                yb = tracks[sleap_idxs, 1, body_idx, tA]
+                d2 = np.hypot(xa - xb, ya - yb)
+                dist_pairs['Nose-Body'] = np.minimum(d1, d2)
+
+            if nose_idx is not None and tail_idx is not None:
+                d1 = _node_pair_dist(nose_idx, tail_idx)
+                xa = tracks[sleap_idxs, 0, nose_idx, tB]
+                ya = tracks[sleap_idxs, 1, nose_idx, tB]
+                xb = tracks[sleap_idxs, 0, tail_idx, tA]
+                yb = tracks[sleap_idxs, 1, tail_idx, tA]
+                d2 = np.hypot(xa - xb, ya - yb)
+                dist_pairs['Nose-Tail'] = np.minimum(d1, d2)
+
+            # Proximity and contact times
+            for label, dist_arr in dist_pairs.items():
+                valid = np.isfinite(dist_arr)
+                prox_frames = float(np.nansum(dist_arr[valid] <= prox_thresh_px))
+                contact_frames = float(np.nansum(dist_arr[valid] <= contact_thresh_px))
+                _add('Proximity', f'{label} Proximity Time', pair_name,
+                     prox_frames / fps, 's')
+                _add('Contact', f'{label} Contact Time', pair_name,
+                     contact_frames / fps, 's')
+
+            # Mean angle when proximal (body-body ≤ 3cm)
+            app_A_key = f'{pfx}/approach_angle_A'
+            app_B_key = f'{pfx}/approach_angle_B'
+            if app_A_key in pair_arrays and app_B_key in pair_arrays:
+                prox_mask = np.isfinite(inter) & (inter <= prox_thresh_px)
+                if np.any(prox_mask):
+                    app_A = pair_arrays[app_A_key][sleap_idxs][prox_mask]
+                    app_B = pair_arrays[app_B_key][sleap_idxs][prox_mask]
+                    mean_angle = float(np.nanmean(app_A + app_B))
+                else:
+                    mean_angle = float('nan')
+                _add('Proximity', 'Mean Angle When Proximal', pair_name,
+                     mean_angle, '°')
+
+    return pd.DataFrame(rows, columns=['Category','Metric','Subject','Value','Unit'])
 
 
 def build_feature_dataframes(tracks, kin, node_names, track_names, fps,

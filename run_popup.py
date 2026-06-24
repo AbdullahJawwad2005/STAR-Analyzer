@@ -27,12 +27,12 @@ from PySide6.QtWidgets import (
     QListWidget,
 )
 from PySide6.QtCore import QRectF
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPixmap, QPainter, QPen, QBrush, QPainterPath
 from pathlib import Path
 from preprocessing import fill_and_smooth_tracks, compute_kinematics
 from behaviors import (compute_single_animal, compute_pairwise, compute_behavior_summary,
                        compute_second_order, _SECOND_ORDER_KEYS, find_node_idx)
-from features import build_feature_dataframes, precompute_feature_arrays
+from features import build_feature_dataframes, precompute_feature_arrays, build_key_metrics_df
 from binned_export import write_binned_xlsx
 from roi_view import ROIView
 try:
@@ -40,6 +40,74 @@ try:
     _GRAPHS_AVAILABLE = True
 except Exception:          # matplotlib not installed or import error
     _GRAPHS_AVAILABLE = False
+
+try:
+    from rf_analysis import run_full_rf_pipeline as _run_rf
+    _RF_AVAILABLE = True
+except Exception:
+    _RF_AVAILABLE = False
+
+
+def _make_icon(kind: str) -> QIcon:
+    """Create a simple 32x32 programmatic icon for window title bars."""
+    px = QPixmap(32, 32)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    if kind == "roi":
+        # Crosshair / frame selector — cyan square with corner marks
+        pen = QPen(QColor(0, 200, 224), 2)
+        p.setPen(pen)
+        # Outer frame
+        p.drawRect(4, 4, 24, 24)
+        # Corner marks (thicker)
+        pen.setWidth(3)
+        p.setPen(pen)
+        for cx, cy in ((4, 4), (28, 4), (4, 28), (28, 28)):
+            dx = 6 if cx == 4 else -6
+            dy = 6 if cy == 4 else -6
+            p.drawLine(cx, cy, cx + dx, cy)
+            p.drawLine(cx, cy, cx, cy + dy)
+
+    elif kind == "inspector":
+        # Magnifying glass — data inspection
+        pen = QPen(QColor(0, 212, 240), 2)
+        p.setPen(pen)
+        p.drawEllipse(6, 4, 16, 16)
+        pen.setWidth(3)
+        p.setPen(pen)
+        p.drawLine(20, 18, 27, 27)
+        # Small lines inside (data rows)
+        pen = QPen(QColor(0, 212, 240), 1)
+        p.setPen(pen)
+        p.drawLine(10, 9, 18, 9)
+        p.drawLine(10, 13, 16, 13)
+
+    elif kind == "export":
+        # Download/export arrow into a tray
+        pen = QPen(QColor(100, 200, 120), 2)
+        p.setPen(pen)
+        p.setBrush(QBrush(QColor(100, 200, 120)))
+        # Arrow pointing down
+        path = QPainterPath()
+        path.moveTo(16, 4)
+        path.lineTo(16, 18)
+        p.drawPath(path)
+        # Arrowhead
+        path2 = QPainterPath()
+        path2.moveTo(10, 15)
+        path2.lineTo(16, 22)
+        path2.lineTo(22, 15)
+        p.drawPath(path2)
+        # Tray
+        p.setBrush(QBrush(QColor(0, 0, 0, 0)))
+        p.drawLine(4, 24, 4, 28)
+        p.drawLine(4, 28, 28, 28)
+        p.drawLine(28, 28, 28, 24)
+
+    p.end()
+    return QIcon(px)
 
 
 class _ProcessWorker(QObject):
@@ -347,6 +415,14 @@ class _ExportWorker(QObject):
                             animal_feat_df.to_excel(writer,  sheet_name="Animal Features",      index=False)
                         if self._want("main_pair_features") and not pair_feat_df.empty:
                             pair_feat_df.to_excel(writer, sheet_name="Pair Features",       index=False)
+                        if self._want("main_key_metrics"):
+                            key_metrics_df = build_key_metrics_df(
+                                tracks, kin, single_beh, pair_beh,
+                                track_arrays, pair_arrays, frame_map,
+                                summary, node_names, track_names,
+                                self._fps, px_per_cm,
+                            )
+                            key_metrics_df.to_excel(writer, sheet_name="Key Metrics", index=False)
 
                 # ---- Binned export (*_binned.xlsx, same directory) ----
                 any_binned = any(self._want(k) for k, _ in ExportOptionsDialog._BINNED_SHEETS)
@@ -388,6 +464,23 @@ class _ExportWorker(QObject):
                         import traceback as _tb
                         self.status.emit(f"Graph export error (skipped): {_ge}")
 
+            # ---- RF analysis (CSV + optional PDF) ----
+            rf_paths = []
+            if _RF_AVAILABLE and self._want("rf_analysis"):
+                try:
+                    _p = Path(path)
+                    base_for_rf = str(_p.with_suffix(""))
+                    from rf_analysis import run_full_rf_pipeline
+                    rf_paths = run_full_rf_pipeline(
+                        track_arrays, pair_arrays, pair_beh, track_names,
+                        self._fps, base_for_rf,
+                        write_plots=self._want("rf_analysis_plots"),
+                        status_cb=self.status.emit,
+                    )
+                except Exception as _re:
+                    import traceback as _tb
+                    self.status.emit(f"RF analysis error (skipped): {_re}")
+
             parts = []
             if any_main:
                 parts.append(f"Main workbook:\n{path}")
@@ -396,6 +489,9 @@ class _ExportWorker(QObject):
             if graph_paths:
                 parts.append(f"Graphs ({len(graph_paths)} PDF files):\n"
                              + "\n".join(f"  • {Path(p).name}" for p in graph_paths))
+            if rf_paths:
+                parts.append(f"RF Analysis ({len(rf_paths)} files):\n"
+                             + "\n".join(f"  • {Path(p).name}" for p in rf_paths))
             msg = "Export complete.\n\n" + "\n\n".join(parts)
             self.finished.emit(msg)
 
@@ -418,6 +514,7 @@ class ExportOptionsDialog(QDialog):
         ("main_engagement_indices",  "Engagement Indices"),
         ("main_animal_features",     "Animal Features"),
         ("main_pair_features",       "Pair Features"),
+        ("main_key_metrics",         "Key Metrics"),
     ]
     _BINNED_SHEETS = [
         ("binned_animal_025",      "Animal 0.25s"),
@@ -434,6 +531,11 @@ class ExportOptionsDialog(QDialog):
         ("graph_sync_oncoplot",        "Synchrony Oncoplot"),
         ("graph_oncoplot_clean",       "Feature Oncoplot (clean)"),
         ("graph_sync_oncoplot_clean",  "Synchrony Oncoplot (clean)"),
+        ("graph_dist_features",        "Feature vs Distance (cumulative)"),
+    ]
+    _RF_ANALYSIS = [
+        ("rf_analysis",       "Random Forest Bout Analysis"),
+        ("rf_analysis_plots", "RF Analysis Plots (PDF)"),
     ]
 
     _GRAPH_SUFFIXES = {
@@ -444,11 +546,17 @@ class ExportOptionsDialog(QDialog):
         "graph_sync_oncoplot":      "_graphs_sync_oncoplot.pdf",
         "graph_oncoplot_clean":     "_graphs_oncoplot_clean.pdf",
         "graph_sync_oncoplot_clean":"_graphs_sync_oncoplot_clean.pdf",
+        "graph_dist_features":      "_graphs_dist_features.pdf",
+    }
+    _RF_SUFFIXES = {
+        "rf_analysis":       ["_rf_bouts.csv", "_rf_report.csv", "_rf_importance.csv"],
+        "rf_analysis_plots": ["_rf_analysis.pdf"],
     }
 
     def __init__(self, graphs_available=True, default_dir="", default_name="export", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Options")
+        self.setWindowIcon(_make_icon("export"))
         self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)
@@ -477,6 +585,11 @@ class ExportOptionsDialog(QDialog):
         if not graphs_available:
             grp.setEnabled(False)
             grp.setToolTip("matplotlib not available — graphs disabled")
+
+        rf_grp = self._build_group(scroll_layout, "Analysis", self._RF_ANALYSIS)
+        if not _RF_AVAILABLE:
+            rf_grp.setEnabled(False)
+            rf_grp.setToolTip("scikit-learn not available — RF analysis disabled")
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -634,6 +747,10 @@ class ExportOptionsDialog(QDialog):
         for key, suffix in self._GRAPH_SUFFIXES.items():
             if opts.get(key, False):
                 self._preview.addItem(f"{name}{suffix}")
+        for key, suffixes in self._RF_SUFFIXES.items():
+            if opts.get(key, False):
+                for suffix in suffixes:
+                    self._preview.addItem(f"{name}{suffix}")
 
     def export_path(self) -> str:
         """Return full base path: folder/basename (no extension)."""
@@ -680,12 +797,55 @@ def _fmt(v):
     return str(v)
 
 
+def _feat_unit(name, ipc):
+    """Return (scale_factor, unit_label) for a feature shown in the inspector.
+
+    *ipc* is 1/px_per_cm (converts px → cm).
+    """
+    nl = name.lower()
+    # --- dimensionless / categorical ---
+    if any(k in nl for k in ('ratio', 'cos_sim', 'efficiency', 'entropy',
+                              'elongation', 'eccentricity', 'compactness',
+                              'circularity', 'scope', 'correlation')):
+        return 1.0, ''
+    # angular features — no px conversion needed
+    if any(k in nl for k in ('heading', 'angle', 'orient')):
+        return 1.0, 'deg'
+    if 'ang_mot' in nl:
+        return 1.0, 'deg/frame'
+    if 'curvature' in nl:
+        return 1.0, 'deg/s'
+    # jerk (must check before accel, since "accel" substring not in "jerk")
+    if 'jerk' in nl:
+        return ipc, 'cm/s\u00b3'
+    # speed_accel (d(speed)/dt) — same unit as accel
+    if 'speed_accel' in nl:
+        return ipc, 'cm/s\u00b2'
+    # acceleration
+    if 'accel' in nl:
+        return ipc, 'cm/s\u00b2'
+    # speed / velocity
+    if any(k in nl for k in ('speed', '_vx', '_vy')):
+        return ipc, 'cm/s'
+    # area (hourglass_area) — px² → cm²
+    if 'area' in nl:
+        return ipc * ipc, 'cm\u00b2'
+    # covariance — px² → cm²
+    if 'covariance' in nl:
+        return ipc * ipc, 'cm\u00b2'
+    # distance / displacement / position
+    if any(k in nl for k in ('dist', 'disp', '_x', '_y')):
+        return ipc, 'cm'
+    return 1.0, ''
+
+
 class _DataPopup(QWidget):
     """Floating window showing all computed data for the current frame."""
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.Tool | Qt.WindowStaysOnTopHint)
+        super().__init__(parent, Qt.Window | Qt.WindowStaysOnTopHint)
         self.setWindowTitle("Frame Data Inspector")
+        self.setWindowIcon(_make_icon("inspector"))
         self.resize(540, 740)
         self.setStyleSheet(
             "QWidget { background:#1a1a1a; color:#ccc;"
@@ -788,8 +948,25 @@ class _DataPopup(QWidget):
 
             if t in track_feat:
                 self._add_section(f"{tname}  —  Animal Features")
+                # Skip features already shown in the Kinematics section above
+                _kin_dupes = set()
+                for nn in node_names:
+                    nn_c = nn.replace(' ', '_')
+                    _kin_dupes.update([
+                        f'{nn_c}_x', f'{nn_c}_y',
+                        f'{nn_c}_speed', f'{nn_c}_accel', f'{nn_c}_jerk',
+                    ])
+                _kin_dupes.add('body_heading_deg')
                 for fname, farr in track_feat[t].items():
-                    self._add_row(fname, lambda si, _a=farr: _fmt(_a[si]))
+                    if fname in _kin_dupes:
+                        continue
+                    scale, unit = _feat_unit(fname, ipc)
+                    label = f"{fname} ({unit})" if unit else fname
+                    if scale == 1.0:
+                        self._add_row(label, lambda si, _a=farr: _fmt(_a[si]))
+                    else:
+                        self._add_row(label,
+                            lambda si, _a=farr, _s=scale: _fmt(_a[si] * _s))
 
         # Pair behaviors & features
         seen = set()
@@ -818,7 +995,13 @@ class _DataPopup(QWidget):
                 kpfx, fname = pkey.rsplit('/', 1)
                 if kpfx != pfx:
                     continue
-                self._add_row(fname, lambda si, _a=arr: _fmt(_a[si]))
+                scale, unit = _feat_unit(fname, ipc)
+                label = f"{fname} ({unit})" if unit else fname
+                if scale == 1.0:
+                    self._add_row(label, lambda si, _a=arr: _fmt(_a[si]))
+                else:
+                    self._add_row(label,
+                        lambda si, _a=arr, _s=scale: _fmt(_a[si] * _s))
 
         self._ready = True
 
@@ -943,7 +1126,7 @@ class RunPopUp(QWidget):
         lbl_orig = QLabel("Original")
         lbl_orig.setAlignment(Qt.AlignCenter)
         self.view = ROIView()
-        self.view.setMinimumSize(480, 270)
+        self.view.setMinimumSize(360, 200)
         left_col = QVBoxLayout()
         left_col.setSpacing(3)
         left_col.addWidget(lbl_orig)
@@ -952,7 +1135,7 @@ class RunPopUp(QWidget):
         lbl_post = QLabel("Post-processed")
         lbl_post.setAlignment(Qt.AlignCenter)
         self.view_b = ROIView()
-        self.view_b.setMinimumSize(480, 270)
+        self.view_b.setMinimumSize(360, 200)
         right_col = QVBoxLayout()
         right_col.setSpacing(3)
         right_col.addWidget(lbl_post)
@@ -1083,7 +1266,15 @@ class RunPopUp(QWidget):
         self._export_thread = None
 
         self.setWindowTitle("ROI Selector")
-        self.resize(1440, 620)
+        self.setWindowIcon(_make_icon("roi"))
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            w = min(1440, avail.width() - 40)
+            h = min(620, avail.height() - 40)
+            self.resize(w, h)
+        else:
+            self.resize(1440, 620)
 
     # ---- Frame display -------------------------------------------------
 
