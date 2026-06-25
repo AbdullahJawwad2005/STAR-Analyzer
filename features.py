@@ -144,46 +144,51 @@ def _shape_features_per_track(tracks, t):
     compactness  = np.full(n_frames, np.nan)
     circularity  = np.full(n_frames, np.nan)
 
-    for f in range(n_frames):
-        pts = tracks[f, :, :, t].T          # (n_nodes, 2)
-        ok  = np.all(np.isfinite(pts), axis=1)
-        pts = pts[ok]
-        nv  = len(pts)
+    # Extract all node positions for this track: (n_frames, n_nodes, 2)
+    pts_all = np.stack([tracks[:, 0, :, t], tracks[:, 1, :, t]], axis=-1)
+    # Valid mask: (n_frames, n_nodes)
+    valid_mask = np.all(np.isfinite(pts_all), axis=-1)
+    n_valid = valid_mask.sum(axis=1)  # (n_frames,)
 
-        if nv < 2:
-            continue
+    # --- Elongation & eccentricity via closed-form 2x2 eigenvalues ---
+    frames_ge2 = np.where(n_valid >= 2)[0]
+    if len(frames_ge2) > 0:
+        # For frames with >= 2 valid points, compute covariance matrix components
+        # Set invalid points to NaN so they don't affect mean
+        pts_masked = pts_all.copy()
+        pts_masked[~valid_mask] = np.nan
 
-        # PCA applied to the (n_nodes x 2) point cloud for this frame.
-        # The 2x2 covariance matrix of the centred node positions has two
-        # eigenvalues: the larger one (ev[0]) is the variance along the major
-        # body axis (the direction the animal is most spread out), and the
-        # smaller one (ev[1]) is the variance along the minor body axis.
-        # Taking the square root of each eigenvalue gives the semi-axis lengths
-        # (analogous to the semi-axes of an equivalent ellipse).
-        # Elongation = major / minor axis ratio: > 1 means the posture is
-        # elongated / stretched; approaching 1 means compact / curled.
-        # Eccentricity follows the standard ellipse definition:
-        #   e = sqrt(1 - (minor/major)^2), ranging from 0 (circle) to 1 (line).
-        mu  = pts.mean(axis=0)
-        ctr = pts - mu
-        cov = (ctr.T @ ctr) / nv
-        ev  = np.sort(np.linalg.eigvalsh(cov))[::-1]   # descending
-        maj = np.sqrt(max(ev[0], 1e-12))
-        mn  = np.sqrt(max(ev[1], 1e-12))
-        elongation[f]   = maj / mn
-        eccentricity[f] = np.sqrt(max(0.0, 1.0 - (mn / maj) ** 2))
+        # Mean position per frame (ignoring NaN)
+        mu = np.nanmean(pts_masked, axis=1)  # (n_frames, 2)
+        # Centre points
+        ctr = pts_masked - mu[:, np.newaxis, :]  # (n_frames, n_nodes, 2)
 
-        # Compactness and circularity both measure how "round" the body shape is,
-        # but they are reciprocals and interpreted from opposite directions:
-        #   Circularity  = 4 * pi * A / P^2  — ranges from 0 to 1;
-        #                  1.0 = perfect circle, decreases as the shape becomes
-        #                  more elongated or irregular (more perimeter for the same area).
-        #   Compactness  = P^2 / (4 * pi * A)  — the reciprocal of circularity;
-        #                  minimum value 1.0 for a circle, increases toward infinity
-        #                  for highly irregular or elongated shapes.
-        # Using both in the feature set gives downstream models two complementary
-        # representations of the same underlying geometric property.
-        if nv >= 3 and _SCIPY_OK:
+        # Covariance components: a = var(x), c = var(y), b = cov(x,y)
+        # Using nanmean over nodes (dividing by n_valid, not n_valid-1)
+        cx = ctr[:, :, 0]  # (n_frames, n_nodes)
+        cy = ctr[:, :, 1]
+        a = np.nanmean(cx**2, axis=1)  # (n_frames,)
+        c = np.nanmean(cy**2, axis=1)
+        b = np.nanmean(cx * cy, axis=1)
+
+        # Closed-form eigenvalues of 2x2 symmetric matrix [[a,b],[b,c]]
+        half_trace = (a + c) / 2.0
+        disc = np.sqrt(np.maximum(((a - c) / 2.0)**2 + b**2, 0.0))
+        ev0 = half_trace + disc   # larger eigenvalue
+        ev1 = half_trace - disc   # smaller eigenvalue
+
+        maj = np.sqrt(np.maximum(ev0, 1e-12))
+        mn  = np.sqrt(np.maximum(ev1, 1e-12))
+
+        elongation[frames_ge2]   = (maj / mn)[frames_ge2]
+        ratio = mn / maj
+        eccentricity[frames_ge2] = np.sqrt(np.maximum(0.0, 1.0 - ratio**2))[frames_ge2]
+
+    # --- Compactness & circularity via ConvexHull (kept per-frame, fast on 7 pts) ---
+    if _SCIPY_OK:
+        frames_ge3 = np.where(n_valid >= 3)[0]
+        for f in frames_ge3:
+            pts = pts_all[f][valid_mask[f]]
             try:
                 hull = _ConvexHull(pts)
                 area = hull.volume    # scipy 2D: volume = area
@@ -717,6 +722,94 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
     return pd.DataFrame(rows, columns=['Category','Metric','Subject','Value','Unit'])
 
 
+def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_names, fps, px_per_cm):
+    """
+    Build a per-second proximity and orientation DataFrame for the first animal pair.
+
+    Columns: Time(s), Within_3cm, Heading_Angle_deg, <node>_dist_cm for each
+    canonical node present in node_names.
+
+    Only meaningful when n_tracks >= 2; caller is responsible for that check.
+    """
+    n_frames, _, n_nodes, n_tracks = tracks.shape
+
+    body_idx  = find_node_idx(node_names, 'body')
+    nose_idx  = find_node_idx(node_names, 'nose')
+    ear_l_idx = find_node_idx(node_names, 'ear_l')
+    ear_r_idx = find_node_idx(node_names, 'ear_r')
+    hip_l_idx = find_node_idx(node_names, 'hip_l')
+    hip_r_idx = find_node_idx(node_names, 'hip_r')
+    tail_idx  = find_node_idx(node_names, 'tail')
+
+    # Canonical node order for distance columns
+    canonical_nodes = [
+        ('nose',   nose_idx,  'nose_dist_cm'),
+        ('ear_l',  ear_l_idx, 'ear_l_dist_cm'),
+        ('ear_r',  ear_r_idx, 'ear_r_dist_cm'),
+        ('body',   body_idx,  'body_dist_cm'),
+        ('hip_l',  hip_l_idx, 'hip_l_dist_cm'),
+        ('hip_r',  hip_r_idx, 'hip_r_dist_cm'),
+        ('tail',   tail_idx,  'tail_dist_cm'),
+    ]
+
+    # Use first pair (tA=0, tB=1)
+    tA, tB = 0, 1
+
+    heading_A = kin['body_heading_deg'][:, tA]
+    heading_B = kin['body_heading_deg'][:, tB]
+    delta_heading = np.abs(((heading_A - heading_B) + 180.0) % 360.0 - 180.0)  # [0, 180]
+
+    # Centroid distance (pixels) for Within_3cm
+    if body_idx is not None:
+        cx_A = tracks[:, 0, body_idx, tA]; cy_A = tracks[:, 1, body_idx, tA]
+        cx_B = tracks[:, 0, body_idx, tB]; cy_B = tracks[:, 1, body_idx, tB]
+    else:
+        cx_A = np.nanmean(tracks[:, 0, :, tA], axis=1)
+        cy_A = np.nanmean(tracks[:, 1, :, tA], axis=1)
+        cx_B = np.nanmean(tracks[:, 0, :, tB], axis=1)
+        cy_B = np.nanmean(tracks[:, 1, :, tB], axis=1)
+    centroid_dist_px = np.hypot(cx_A - cx_B, cy_A - cy_B)
+
+    # Group frame_map into 1-second bins keyed by integer second
+    bins = {}
+    for vid_frame, sleap_idx in frame_map.items():
+        sec = int(vid_frame // fps)
+        bins.setdefault(sec, []).append(sleap_idx)
+
+    rows = []
+    for sec in sorted(bins):
+        idxs = np.array(bins[sec])
+
+        # Within_3cm: binary — mean centroid distance that second < 3 cm
+        cd = centroid_dist_px[idxs]
+        mean_dist_cm = float(np.nanmean(cd)) / px_per_cm
+        within_3 = 1 if mean_dist_cm < 3.0 else 0
+
+        # Heading angle
+        ha = float(np.nanmean(delta_heading[idxs]))
+
+        row = {'Time(s)': sec, 'Within_3cm': within_3, 'Heading_Angle_deg': round(ha, 2)}
+
+        # Per-node distances
+        for _cname, idx, col in canonical_nodes:
+            if idx is None:
+                continue
+            xa = tracks[idxs, 0, idx, tA]; ya = tracks[idxs, 1, idx, tA]
+            xb = tracks[idxs, 0, idx, tB]; yb = tracks[idxs, 1, idx, tB]
+            d_px = np.hypot(xa - xb, ya - yb)
+            row[col] = round(float(np.nanmean(d_px)) / px_per_cm, 4)
+
+        rows.append(row)
+
+    # Build ordered columns
+    col_order = ['Time(s)', 'Within_3cm', 'Heading_Angle_deg']
+    for _cname, idx, col in canonical_nodes:
+        if idx is not None:
+            col_order.append(col)
+
+    return pd.DataFrame(rows, columns=col_order)
+
+
 def build_feature_dataframes(tracks, kin, node_names, track_names, fps,
                              frame_map, roi=None, _precomputed=None):
     """
@@ -762,47 +855,77 @@ def build_feature_dataframes(tracks, kin, node_names, track_names, fps,
         pair_prefixes[f't{tA}_t{tB}'] = (tA, tB)
 
     # -----------------------------------------------------------------------
-    # Assemble Animal Features DataFrame
+    # Assemble Animal Features DataFrame (vectorized column-first)
     # -----------------------------------------------------------------------
 
-    animal_rows = []
-    for vid_frame, sleap_idx in sorted(frame_map.items()):
-        time_s = round(vid_frame / fps, 4)
-        for t, tname in enumerate(track_names):
-            row = {'Frame': vid_frame, 'Time(s)': time_s, 'Track': tname}
-            for feat_name, arr in track_arrays[t].items():
-                val = arr[sleap_idx]
-                try:
-                    row[feat_name] = '' if pd.isna(val) else val
-                except (TypeError, ValueError):
-                    row[feat_name] = val
-            animal_rows.append(row)
+    sorted_items = sorted(frame_map.items())
+    vid_frames = np.array([vf for vf, _ in sorted_items])
+    sleap_idxs = np.array([si for _, si in sorted_items])
+    n_mapped = len(vid_frames)
+    n_t = len(track_names)
 
-    animal_df = pd.DataFrame(animal_rows)
+    # Repeat/tile for (n_mapped * n_t) rows
+    col_frame = np.repeat(vid_frames, n_t)
+    col_time = np.round(np.repeat(vid_frames.astype(np.float64), n_t) / fps, 4)
+    track_tile = np.tile(np.arange(n_t), n_mapped)
+    col_track = np.array(track_names)[track_tile]
+    sleap_rep = np.repeat(sleap_idxs, n_t)
+
+    animal_cols = {'Frame': col_frame, 'Time(s)': col_time, 'Track': col_track}
+
+    # Get feature names from first track
+    feat_names = list(track_arrays[0].keys())
+    for feat_name in feat_names:
+        # Stack arrays from all tracks: (n_sleap_frames, n_tracks)
+        stacked = np.column_stack([track_arrays[t][feat_name] for t in range(n_t)])
+        # Index: for each output row, pick sleap_rep[i] row and track_tile[i] column
+        vals = stacked[sleap_rep, track_tile]
+        animal_cols[feat_name] = vals
+
+    animal_df = pd.DataFrame(animal_cols)
 
     # -----------------------------------------------------------------------
-    # Assemble Pair Features DataFrame
+    # Assemble Pair Features DataFrame (vectorized column-first)
     # -----------------------------------------------------------------------
 
-    pair_rows = []
-    for vid_frame, sleap_idx in sorted(frame_map.items()):
-        time_s = round(vid_frame / fps, 4)
-        for pfx, (tA, tB) in pair_prefixes.items():
-            nA = track_names[tA] if tA < len(track_names) else f't{tA}'
-            nB = track_names[tB] if tB < len(track_names) else f't{tB}'
-            row = {'Frame': vid_frame, 'Time(s)': time_s,
-                   'Track_A': nA, 'Track_B': nB}
-            for key, arr in pair_arrays.items():
-                kpfx, feat = key.rsplit('/', 1)
-                if kpfx != pfx:
-                    continue
-                val = arr[sleap_idx]
-                try:
-                    row[feat] = '' if pd.isna(val) else val
-                except (TypeError, ValueError):
-                    row[feat] = val
-            pair_rows.append(row)
+    if pair_prefixes and pair_arrays:
+        n_pairs = len(pair_prefixes)
+        pfx_list = list(pair_prefixes.keys())
+        pair_info = list(pair_prefixes.values())  # list of (tA, tB)
 
-    pair_df = pd.DataFrame(pair_rows) if pair_rows else pd.DataFrame()
+        col_p_frame = np.repeat(vid_frames, n_pairs)
+        col_p_time = np.round(np.repeat(vid_frames.astype(np.float64), n_pairs) / fps, 4)
+        pair_tile = np.tile(np.arange(n_pairs), n_mapped)
+
+        col_trackA = np.array([track_names[pair_info[p][0]] if pair_info[p][0] < len(track_names)
+                               else f't{pair_info[p][0]}' for p in range(n_pairs)])[pair_tile]
+        col_trackB = np.array([track_names[pair_info[p][1]] if pair_info[p][1] < len(track_names)
+                               else f't{pair_info[p][1]}' for p in range(n_pairs)])[pair_tile]
+
+        pair_cols = {'Frame': col_p_frame, 'Time(s)': col_p_time,
+                     'Track_A': col_trackA, 'Track_B': col_trackB}
+
+        sleap_p_rep = np.repeat(sleap_idxs, n_pairs)
+
+        # Group pair_arrays by prefix
+        feat_by_pfx = {}
+        for key in pair_arrays:
+            kpfx, feat = key.rsplit('/', 1)
+            feat_by_pfx.setdefault(feat, {})[kpfx] = pair_arrays[key]
+
+        for feat, pfx_dict in feat_by_pfx.items():
+            # Build array: (n_sleap_frames, n_pairs) — stack in pfx_list order
+            cols_list = []
+            for pfx in pfx_list:
+                if pfx in pfx_dict:
+                    cols_list.append(pfx_dict[pfx])
+                else:
+                    cols_list.append(np.full(tracks.shape[0], np.nan))
+            stacked = np.column_stack(cols_list)
+            pair_cols[feat] = stacked[sleap_p_rep, pair_tile]
+
+        pair_df = pd.DataFrame(pair_cols)
+    else:
+        pair_df = pd.DataFrame()
 
     return animal_df, pair_df

@@ -93,12 +93,13 @@ Excel workbooks for analysis
 
 ## Outputs
 
-Running an export produces two Excel workbooks:
+Running an export produces three Excel workbooks:
 
 | File | Contents |
 |---|---|
 | `{name}.xlsx` | Tracking Data, Zone Summary, Session Info, 1st Order Behaviors, Behavior Summary, Engagement Indices, Animal Features, Pair Features |
 | `{name}_binned.xlsx` | Animal 0.25s, Pair 0.25s, Engagement Indices 0.25s, Animal 1s, Pair 1s |
+| `{name}_key_metrics.xlsx` | Key Metrics (session summary), Proximity & Orientation (per-second inter-animal distances and heading; 2-animal sessions only) |
 
 ---
 

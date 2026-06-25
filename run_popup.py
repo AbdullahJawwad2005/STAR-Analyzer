@@ -1,3 +1,5 @@
+import gc
+import threading
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QTimer, QDateTime, QThread, QObject
@@ -25,6 +27,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QLineEdit,
     QListWidget,
+    QTextEdit,
+    QStyle,
 )
 from PySide6.QtCore import QRectF
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPixmap, QPainter, QPen, QBrush, QPainterPath
@@ -32,7 +36,8 @@ from pathlib import Path
 from preprocessing import fill_and_smooth_tracks, compute_kinematics
 from behaviors import (compute_single_animal, compute_pairwise, compute_behavior_summary,
                        compute_second_order, _SECOND_ORDER_KEYS, find_node_idx)
-from features import build_feature_dataframes, precompute_feature_arrays, build_key_metrics_df
+from features import (build_feature_dataframes, precompute_feature_arrays,
+                      build_key_metrics_df, build_proximity_orientation_df)
 from binned_export import write_binned_xlsx
 from roi_view import ROIView
 try:
@@ -46,6 +51,45 @@ try:
     _RF_AVAILABLE = True
 except Exception:
     _RF_AVAILABLE = False
+
+# Limit simultaneous exports to prevent OOM when multiple windows are open
+_EXPORT_SEMAPHORE = threading.Semaphore(2)
+
+
+class _ScrollableMessageBox(QDialog):
+    """Resizable, scrollable message dialog replacing bare QMessageBox for long content."""
+
+    def __init__(self, parent, title, message, *, critical=False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(450, 250)
+        if critical:
+            self.resize(550, 350)
+        else:
+            self.resize(480, 280)
+
+        layout = QVBoxLayout(self)
+
+        # Icon + text area in a horizontal layout
+        top = QHBoxLayout()
+        icon_label = QLabel()
+        style = self.style()
+        sp = QStyle.StandardPixmap.SP_MessageBoxCritical if critical else QStyle.StandardPixmap.SP_MessageBoxInformation
+        icon_label.setPixmap(style.standardIcon(sp).pixmap(48, 48))
+        icon_label.setAlignment(Qt.AlignTop)
+        top.addWidget(icon_label)
+
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(message)
+        if critical:
+            text_edit.setFont(QFont("Consolas", 9))
+        top.addWidget(text_edit, 1)
+        layout.addLayout(top)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        btn_box.accepted.connect(self.accept)
+        layout.addWidget(btn_box)
 
 
 def _make_icon(kind: str) -> QIcon:
@@ -241,40 +285,75 @@ class _ExportWorker(QObject):
             # ---- Build main data table ----
             self.status.emit("Building data table…")
             sorted_frames = sorted(frame_map.items())
-            vid_frame_0 = sorted_frames[0][0] if sorted_frames else 0
-            rows = []
-            for vid_frame, sleap_idx in sorted_frames:
-                time_s = round((vid_frame - vid_frame_0) / self._fps, 4)
-                for t in range(tracks.shape[3]):
-                    pts = tracks[sleap_idx, :, :, t]       # (2, n_nodes)
-                    for n, node in enumerate(node_names):
-                        x, y = float(pts[0, n]), float(pts[1, n])
-                        if np.isnan(x) or np.isnan(y):
-                            zone = "Undetected"
-                            x_cm = y_cm = float("nan")
-                        else:
-                            zone  = _classify_zone(x, y, rx0, ry0, rx1, ry1, strip)
-                            x_cm  = round((x - rx0) / px_per_cm, 3)
-                            y_cm  = round((y - ry0) / px_per_cm, 3)
-                        rows.append({
-                            "Frame":          vid_frame,
-                            "Time (s)":       time_s,
-                            "Track":          track_names[t],
-                            "Body Part":      node,
-                            "X (px)":         round(x, 2) if not np.isnan(x) else float("nan"),
-                            "Y (px)":         round(y, 2) if not np.isnan(y) else float("nan"),
-                            "X (cm)":         x_cm,
-                            "Y (cm)":         y_cm,
-                            "Zone":           zone,
-                            "Vx (cm/s)":      round(float(kin["vx"][sleap_idx, n, t])    * inv_ppcm,  3),
-                            "Vy (cm/s)":      round(float(kin["vy"][sleap_idx, n, t])    * inv_ppcm,  3),
-                            "Speed (cm/s)":   round(float(kin["speed"][sleap_idx, n, t]) * inv_ppcm,  3),
-                            "Heading (deg)":  round(float(kin["heading_deg"][sleap_idx, n, t]),        2),
-                            "Accel (cm/s²)":  round(float(kin["accel"][sleap_idx, n, t]) * inv_ppcm, 3),
-                            "Jerk (cm/s³)":   round(float(kin["jerk"][sleap_idx, n, t])  * inv_ppcm, 3),
-                        })
+            vid_frames_arr = np.array([vf for vf, _ in sorted_frames])
+            sleap_idxs_arr = np.array([si for _, si in sorted_frames])
+            vid_frame_0 = vid_frames_arr[0] if len(vid_frames_arr) else 0
+            n_mapped = len(vid_frames_arr)
+            n_t = tracks.shape[3]
+            n_n = len(node_names)
 
-            df = pd.DataFrame(rows)
+            # Time array
+            time_arr = np.round((vid_frames_arr - vid_frame_0) / self._fps, 4)
+
+            # Build columns as flat arrays (n_mapped * n_t * n_n)
+            total_rows = n_mapped * n_t * n_n
+            col_frame = np.repeat(vid_frames_arr, n_t * n_n)
+            col_time  = np.repeat(time_arr, n_t * n_n)
+
+            # Track names repeated
+            track_tile = np.tile(np.repeat(np.arange(n_t), n_n), n_mapped)
+            col_track = np.array(track_names)[track_tile]
+
+            # Node names tiled
+            node_tile = np.tile(np.arange(n_n), n_mapped * n_t)
+            col_node = np.array(node_names)[node_tile]
+
+            # Sleap indices repeated for indexing
+            sleap_rep = np.repeat(sleap_idxs_arr, n_t * n_n)
+
+            # Extract x, y for all (sleap_idx, node, track) combinations
+            x_all = tracks[sleap_rep, 0, node_tile, track_tile]
+            y_all = tracks[sleap_rep, 1, node_tile, track_tile]
+
+            # Zone classification (vectorized)
+            nan_mask = np.isnan(x_all) | np.isnan(y_all)
+            col_zone = np.full(total_rows, 'Undetected', dtype=object)
+            valid = ~nan_mask
+            if np.any(valid):
+                col_zone[valid] = _classify_zone_vec(
+                    x_all[valid], y_all[valid], rx0, ry0, rx1, ry1, strip)
+
+            # Coordinate conversions
+            x_cm = np.where(nan_mask, np.nan, np.round((x_all - rx0) * inv_ppcm, 3))
+            y_cm = np.where(nan_mask, np.nan, np.round((y_all - ry0) * inv_ppcm, 3))
+            x_px = np.where(nan_mask, np.nan, np.round(x_all, 2))
+            y_px = np.where(nan_mask, np.nan, np.round(y_all, 2))
+
+            # Kinematics columns
+            col_vx    = np.round(kin["vx"][sleap_rep, node_tile, track_tile] * inv_ppcm, 3)
+            col_vy    = np.round(kin["vy"][sleap_rep, node_tile, track_tile] * inv_ppcm, 3)
+            col_speed = np.round(kin["speed"][sleap_rep, node_tile, track_tile] * inv_ppcm, 3)
+            col_hdg   = np.round(kin["heading_deg"][sleap_rep, node_tile, track_tile], 2)
+            col_accel = np.round(kin["accel"][sleap_rep, node_tile, track_tile] * inv_ppcm, 3)
+            col_jerk  = np.round(kin["jerk"][sleap_rep, node_tile, track_tile] * inv_ppcm, 3)
+
+            df = pd.DataFrame({
+                "Frame":         col_frame,
+                "Time (s)":      col_time,
+                "Track":         col_track,
+                "Body Part":     col_node,
+                "X (px)":        x_px,
+                "Y (px)":        y_px,
+                "X (cm)":        x_cm,
+                "Y (cm)":        y_cm,
+                "Zone":          col_zone,
+                "Vx (cm/s)":     col_vx,
+                "Vy (cm/s)":     col_vy,
+                "Speed (cm/s)":  col_speed,
+                "Heading (deg)": col_hdg,
+                "Accel (cm/s²)": col_accel,
+                "Jerk (cm/s³)":  col_jerk,
+            })
 
             # ---- Build behavior dataframes (one row per video frame) ----
             single_keys = ('stationary', 'walking', 'running', 'turning', 'dir_reversal')
@@ -282,6 +361,8 @@ class _ExportWorker(QObject):
             # Pre-build pair prefix → track-name column prefix mapping
             pair_col_map = {}
             for key in pair_beh:
+                if '/' not in key:
+                    continue
                 pfx, beh = key.rsplit('/', 1)
                 if pfx not in pair_col_map:
                     parts = pfx.split('_')
@@ -296,51 +377,37 @@ class _ExportWorker(QObject):
 
             # Separate 1st-order and 2nd-order pair behavior keys
             _so_key_set = set(_SECOND_ORDER_KEYS)
-            first_order_pair_keys = {k: v for k, v in pair_beh.items()
+            _valid_pair = {k: v for k, v in pair_beh.items() if '/' in k}
+            first_order_pair_keys = {k: v for k, v in _valid_pair.items()
                                      if k.rsplit('/', 1)[1] not in _so_key_set}
-            second_order_pair_keys = {k: v for k, v in pair_beh.items()
+            second_order_pair_keys = {k: v for k, v in _valid_pair.items()
                                       if k.rsplit('/', 1)[1] in _so_key_set}
 
             # 1st Order Behaviors sheet
-            beh_rows = []
-            for vid_frame, sleap_idx in sorted(frame_map.items()):
-                row = {
-                    'Frame':   vid_frame,
-                    'Time(s)': round(vid_frame / self._fps, 4),
-                }
-                for bname in single_keys:
-                    for t, tname in enumerate(track_names):
-                        row[f'{tname}/{bname}'] = int(single_beh[bname][sleap_idx, t])
-                for key, arr in first_order_pair_keys.items():
-                    pfx, beh = key.rsplit('/', 1)
-                    col = f'{pair_col_map[pfx]}/{beh}'
-                    val = arr[sleap_idx]
-                    try:
-                        row[col] = '' if pd.isna(val) else val
-                    except (TypeError, ValueError):
-                        row[col] = val
-                beh_rows.append(row)
-
-            beh_df = pd.DataFrame(beh_rows)
+            beh_col = {
+                'Frame':   vid_frames_arr,
+                'Time(s)': np.round(vid_frames_arr / self._fps, 4),
+            }
+            for bname in single_keys:
+                for t, tname in enumerate(track_names):
+                    beh_col[f'{tname}/{bname}'] = single_beh[bname][sleap_idxs_arr, t].astype(int)
+            for key, arr in first_order_pair_keys.items():
+                pfx, beh = key.rsplit('/', 1)
+                col_name = f'{pair_col_map[pfx]}/{beh}'
+                vals = arr[sleap_idxs_arr]
+                beh_col[col_name] = vals
+            beh_df = pd.DataFrame(beh_col)
 
             # 2nd Order Behaviors sheet
-            beh2_rows = []
-            for vid_frame, sleap_idx in sorted(frame_map.items()):
-                row = {
-                    'Frame':   vid_frame,
-                    'Time(s)': round(vid_frame / self._fps, 4),
-                }
-                for key, arr in second_order_pair_keys.items():
-                    pfx, beh = key.rsplit('/', 1)
-                    col = f'{pair_col_map[pfx]}/{beh}'
-                    val = arr[sleap_idx]
-                    try:
-                        row[col] = '' if pd.isna(val) else val
-                    except (TypeError, ValueError):
-                        row[col] = val
-                beh2_rows.append(row)
-
-            beh2_df = pd.DataFrame(beh2_rows)
+            beh2_col = {
+                'Frame':   vid_frames_arr,
+                'Time(s)': np.round(vid_frames_arr / self._fps, 4),
+            }
+            for key, arr in second_order_pair_keys.items():
+                pfx, beh = key.rsplit('/', 1)
+                col_name = f'{pair_col_map[pfx]}/{beh}'
+                beh2_col[col_name] = arr[sleap_idxs_arr]
+            beh2_df = pd.DataFrame(beh2_col)
 
             binned_path = None    # set inside xlsx branch; used in success message
             graph_paths = []      # set inside xlsx branch; used in success message
@@ -415,14 +482,26 @@ class _ExportWorker(QObject):
                             animal_feat_df.to_excel(writer,  sheet_name="Animal Features",      index=False)
                         if self._want("main_pair_features") and not pair_feat_df.empty:
                             pair_feat_df.to_excel(writer, sheet_name="Pair Features",       index=False)
-                        if self._want("main_key_metrics"):
-                            key_metrics_df = build_key_metrics_df(
-                                tracks, kin, single_beh, pair_beh,
-                                track_arrays, pair_arrays, frame_map,
-                                summary, node_names, track_names,
+                # ---- Key Metrics separate file (*_key_metrics.xlsx) ----
+                if self._want("main_key_metrics"):
+                    key_metrics_df = build_key_metrics_df(
+                        tracks, kin, single_beh, pair_beh,
+                        track_arrays, pair_arrays, frame_map,
+                        summary, node_names, track_names,
+                        self._fps, px_per_cm,
+                    )
+                    _p = Path(path)
+                    km_path = str(_p.with_name(_p.stem + "_key_metrics" + _p.suffix))
+                    self.status.emit("Writing key metrics file…")
+                    with pd.ExcelWriter(km_path, engine="openpyxl") as km_writer:
+                        key_metrics_df.to_excel(km_writer, sheet_name="Key Metrics", index=False)
+                        if tracks.shape[3] >= 2:
+                            prox_df = build_proximity_orientation_df(
+                                tracks, kin, frame_map, node_names, track_names,
                                 self._fps, px_per_cm,
                             )
-                            key_metrics_df.to_excel(writer, sheet_name="Key Metrics", index=False)
+                            prox_df.to_excel(km_writer, sheet_name="Proximity & Orientation",
+                                             index=False)
 
                 # ---- Binned export (*_binned.xlsx, same directory) ----
                 any_binned = any(self._want(k) for k, _ in ExportOptionsDialog._BINNED_SHEETS)
@@ -493,6 +572,7 @@ class _ExportWorker(QObject):
                 parts.append(f"RF Analysis ({len(rf_paths)} files):\n"
                              + "\n".join(f"  • {Path(p).name}" for p in rf_paths))
             msg = "Export complete.\n\n" + "\n\n".join(parts)
+            del tracks, kin, single_beh, pair_beh, track_arrays, pair_arrays
             self.finished.emit(msg)
 
         except Exception as exc:
@@ -971,6 +1051,8 @@ class _DataPopup(QWidget):
         # Pair behaviors & features
         seen = set()
         for key in pair_beh:
+            if '/' not in key:
+                continue
             pfx = key.rsplit('/', 1)[0]
             if pfx in seen:
                 continue
@@ -985,6 +1067,8 @@ class _DataPopup(QWidget):
 
             self._add_section(f"{nA} vs {nB}  —  Pair Behaviors")
             for pkey, arr in pair_beh.items():
+                if '/' not in pkey:
+                    continue
                 kpfx, bname = pkey.rsplit('/', 1)
                 if kpfx != pfx:
                     continue
@@ -992,6 +1076,8 @@ class _DataPopup(QWidget):
 
             self._add_section(f"{nA} vs {nB}  —  Pair Features")
             for pkey, arr in pair_feat.items():
+                if '/' not in pkey:
+                    continue
                 kpfx, fname = pkey.rsplit('/', 1)
                 if kpfx != pfx:
                     continue
@@ -1032,6 +1118,27 @@ def _classify_zone(x, y, rx0, ry0, rx1, ry1, strip):
     if bottom: return "W3"
     if left:   return "W4"
     return "Open"
+
+
+def _classify_zone_vec(x, y, rx0, ry0, rx1, ry1, strip):
+    """Vectorized zone classification for arrays of coordinates."""
+    n = len(x)
+    zones = np.full(n, 'Open', dtype=object)
+    left   = x < rx0 + strip
+    right  = x > rx1 - strip
+    top    = y < ry0 + strip
+    bottom = y > ry1 - strip
+    # Walls (overwritten by corners below)
+    zones[top]    = 'W1'
+    zones[right]  = 'W2'
+    zones[bottom] = 'W3'
+    zones[left]   = 'W4'
+    # Corners
+    zones[left  & top]    = 'C1'
+    zones[right & top]    = 'C2'
+    zones[right & bottom] = 'C3'
+    zones[left  & bottom] = 'C4'
+    return zones
 
 
 class RunPopUp(QWidget):
@@ -1110,7 +1217,6 @@ class RunPopUp(QWidget):
 
         self._build_ui()
         self._show_frame(0)
-        self.show()
 
     # ---- UI construction -----------------------------------------------
 
@@ -1267,14 +1373,7 @@ class RunPopUp(QWidget):
 
         self.setWindowTitle("ROI Selector")
         self.setWindowIcon(_make_icon("roi"))
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            avail = screen.availableGeometry()
-            w = min(1440, avail.width() - 40)
-            h = min(620, avail.height() - 40)
-            self.resize(w, h)
-        else:
-            self.resize(1440, 620)
+        self.showMaximized()
 
     # ---- Frame display -------------------------------------------------
 
@@ -1453,6 +1552,11 @@ class RunPopUp(QWidget):
         if self._sleap_data is None:
             QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first.")
             return
+        try:
+            if self._proc_thread is not None and self._proc_thread.isRunning():
+                return
+        except RuntimeError:
+            pass
 
         self._btn_process.setEnabled(False)
         self._btn_process.setText("Processing…")
@@ -1476,6 +1580,9 @@ class RunPopUp(QWidget):
         self._proc_thread.start()
 
     def _on_process_done(self, processed_data):
+        if self._analysis_cache is not None:
+            self._analysis_cache.clear()
+            self._analysis_cache = None
         self._processed_sleap_data = processed_data
         self._btn_process.setEnabled(True)
         self._btn_process.setText("Process")
@@ -1487,12 +1594,15 @@ class RunPopUp(QWidget):
         self._btn_process.setEnabled(True)
         self._btn_process.setText("Process")
         self._progress_bar.setVisible(False)
-        QMessageBox.critical(self, "Process failed", msg)
+        _ScrollableMessageBox(self, "Process failed", msg, critical=True).exec()
 
     # ---- Analysis precompute & overlay ---------------------------------
 
     def _precompute_analysis(self):
         """Cache kinematics, behaviors and features for overlay/popup use."""
+        if self._analysis_cache is not None:
+            self._analysis_cache.clear()
+            self._analysis_cache = None
         data = self._processed_sleap_data
         if data is None:
             return
@@ -1598,6 +1708,8 @@ class RunPopUp(QWidget):
         # Pair summary
         seen = set()
         for key in pb:
+            if '/' not in key:
+                continue
             pfx = key.rsplit('/', 1)[0]
             if pfx in seen:
                 continue
@@ -1665,6 +1777,16 @@ class RunPopUp(QWidget):
         if roi is None:
             QMessageBox.warning(self, "No ROI", "Draw an ROI first.")
             return
+        try:
+            if self._export_thread is not None and self._export_thread.isRunning():
+                return
+        except RuntimeError:
+            pass
+
+        if not _EXPORT_SEMAPHORE.acquire(blocking=False):
+            QMessageBox.information(self, "Export Queued",
+                "Another export is already running. Please wait for it to finish.")
+            return
 
         # Unified export dialog (checkboxes + save location)
         vp = Path(self._video_path)
@@ -1675,6 +1797,7 @@ class RunPopUp(QWidget):
             parent=self,
         )
         if dlg.exec() != QDialog.Accepted:
+            _EXPORT_SEMAPHORE.release()
             return
         export_opts = dlg.options()
         base_path = dlg.export_path()       # "C:/Users/results/my_experiment"
@@ -1729,20 +1852,22 @@ class RunPopUp(QWidget):
 
     def _on_export_done(self, msg):
         """Called on the main thread when _ExportWorker finishes successfully."""
+        _EXPORT_SEMAPHORE.release()
         self._btn_export.setEnabled(True)
         self._btn_export.setText("Export")
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(100)
         self._progress_bar.setVisible(False)
-        QMessageBox.information(self, "Done", msg)
+        _ScrollableMessageBox(self, "Export Complete", msg).exec()
 
     def _on_export_error(self, msg):
         """Called on the main thread when _ExportWorker raises an exception."""
+        _EXPORT_SEMAPHORE.release()
         self._btn_export.setEnabled(True)
         self._btn_export.setText("Export")
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setVisible(False)
-        QMessageBox.critical(self, "Export failed", msg)
+        _ScrollableMessageBox(self, "Export failed", msg, critical=True).exec()
 
     def closeEvent(self, event):
         try:
@@ -1757,4 +1882,12 @@ class RunPopUp(QWidget):
             pass  # C++ QThread already deleted — export is done
         self._timer.stop()
         self._cap.release()
+        if self._analysis_cache is not None:
+            self._analysis_cache.clear()
+            self._analysis_cache = None
+        self._processed_sleap_data = None
+        if self._data_popup is not None:
+            self._data_popup.close()
+            self._data_popup = None
+        gc.collect()
         super().closeEvent(event)
