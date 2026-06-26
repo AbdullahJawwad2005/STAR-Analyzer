@@ -1,8 +1,11 @@
+import gc
 import cv2
 
 from PySide6.QtCore import Qt, QDateTime
-from PySide6.QtGui import QGuiApplication, QFont
+from PySide6.QtGui import QGuiApplication, QFont, QIcon, QPixmap, QPainter, QPen, QBrush, QColor, QPolygonF
+from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QGroupBox,
@@ -20,18 +23,42 @@ from run_popup import RunPopUp
 from sleap_loader import load_sleap
 
 
+def _make_star_icon() -> QIcon:
+    """Create a 32x32 star icon for the STAR Analyzer main window."""
+    import math
+    px = QPixmap(32, 32)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing)
+    # 5-pointed star
+    cx, cy, r_out, r_in = 16, 16, 14, 6
+    points = []
+    for i in range(10):
+        angle = math.radians(-90 + i * 36)
+        r = r_out if i % 2 == 0 else r_in
+        points.append(QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    poly = QPolygonF(points)
+    p.setPen(QPen(QColor(31, 111, 139), 1))
+    p.setBrush(QBrush(QColor(31, 111, 139)))
+    p.drawPolygon(poly)
+    p.end()
+    return QIcon(px)
+
+
 class MainWindow(QMainWindow):
     """Main application window for loading STAR video/tracking data."""
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("STAR Analyzer")
+        self.setWindowIcon(_make_star_icon())
         self.setMinimumSize(860, 440)
 
         self.video_path = None
         self.video_info = None
         self.sleap_data = None
         self.roi = None
+        self._popups: list = []
 
         self._build_ui()
 
@@ -197,12 +224,20 @@ class MainWindow(QMainWindow):
             self.sleap_data = None
             self.log(f"Failed to load SLEAP file: {exc}", 'error')
 
+    @property
+    def _popup(self):
+        return self._popups[-1] if self._popups else None
+
     def open_run_popup(self):
         if not self.video_path:
             self.log("Select and validate a video first.", 'warn')
             return
-        self._popup = RunPopUp(self.video_path, sleap_data=self.sleap_data)
-        self._popup.roi_selected.connect(self._on_roi_selected)
+        popup = RunPopUp(self.video_path, sleap_data=self.sleap_data)
+        popup.roi_selected.connect(self._on_roi_selected)
+        popup.destroyed.connect(
+            lambda p=popup: self._popups.remove(p) if p in self._popups else None
+        )
+        self._popups.append(popup)
 
     def _on_roi_selected(self, roi):
         self.roi = roi

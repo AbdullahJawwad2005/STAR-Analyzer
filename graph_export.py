@@ -313,6 +313,97 @@ def _write_distance_plot(pair_arrays, times, sleap_idxs, track_names,
 
 
 # ---------------------------------------------------------------------------
+# 3b. Distance–Feature Cumulative Plot
+# ---------------------------------------------------------------------------
+
+def _write_distance_feature_plot(pdf_path, track_arrays, pair_arrays,
+                                  frame_map, track_names, node_names,
+                                  fps, px_per_cm, status_cb=None):
+    """One page per pair: 4×2 grid of features plotted against cumulative distance threshold."""
+    if status_cb:
+        status_cb("Graphs: distance–feature plots…")
+
+    n_tracks = len(track_names)
+    if n_tracks < 2:
+        return
+
+    _, sleap_idxs = _get_times_and_indices(frame_map, fps)
+    if len(sleap_idxs) == 0:
+        return
+
+    bp = _body_prefix(node_names)
+    px2cm = max(px_per_cm, 1e-9)
+
+    # (key, label, needs_spatial_conversion)
+    feature_specs = [
+        (f"{bp}_speed",    "Speed (cm/s)",         True),
+        (f"{bp}_accel",    "Acceleration (cm/s²)",  True),
+        (f"{bp}_jerk",     "Jerk (cm/s³)",          True),
+        ("speed_accel",    "Speed Accel (cm/s²)",   True),
+        ("curvature",      "Curvature (°/s)",       False),
+        ("elongation",     "Elongation",            False),
+        ("hourglass_ratio","Hourglass Ratio",       False),
+        ("path_efficiency","Path Efficiency",       False),
+    ]
+
+    colors = ["#2196F3", "#E91E63"]
+
+    with PdfPages(pdf_path) as pdf:
+        for tA, tB in combinations(range(n_tracks), 2):
+            pfx = f"t{tA}_t{tB}"
+            dist_key = f"{pfx}/inter_animal_dist"
+            dist_raw = pair_arrays.get(dist_key)
+            if dist_raw is None:
+                continue
+
+            dist_cm = dist_raw[sleap_idxs].astype(float) / px2cm
+            max_dist = np.nanmax(dist_cm)
+            if not np.isfinite(max_dist) or max_dist < 1.0:
+                continue
+
+            thresholds = np.arange(1, int(max_dist) + 1, 1)
+
+            nA = track_names[tA] if tA < n_tracks else f"t{tA}"
+            nB = track_names[tB] if tB < n_tracks else f"t{tB}"
+
+            fig, axes = plt.subplots(4, 2, figsize=(14, 10))
+            fig.suptitle(f"{nA} vs {nB} — Feature by Proximity",
+                         fontsize=13, fontweight="bold")
+
+            for f_idx, (feat_key, feat_label, spatial) in enumerate(feature_specs):
+                ax = axes[f_idx // 2, f_idx % 2]
+
+                for t_idx, (t, color, name) in enumerate(
+                        [(tA, colors[0], nA), (tB, colors[1], nB)]):
+                    feat_arr = _extract(track_arrays[t], feat_key, sleap_idxs)
+                    if spatial:
+                        feat_arr = feat_arr / px2cm
+
+                    means = np.empty(len(thresholds))
+                    for i, d in enumerate(thresholds):
+                        mask = dist_cm <= d
+                        vals = feat_arr[mask]
+                        means[i] = np.nanmean(vals) if len(vals) else np.nan
+
+                    fin = np.isfinite(means)
+                    if np.any(fin):
+                        ax.plot(thresholds[fin], means[fin], linewidth=1.2,
+                                color=color, alpha=0.85, label=name,
+                                marker=".", markersize=3)
+
+                ax.set_ylabel(feat_label, fontsize=8)
+                ax.set_xlabel("Cumulative distance threshold (cm)", fontsize=7)
+                ax.legend(fontsize=7, loc="best")
+                ax.yaxis.set_major_locator(MaxNLocator(5))
+                ax.xaxis.set_major_locator(MaxNLocator(8))
+
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+            pdf.savefig(fig, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            gc.collect()
+
+
+# ---------------------------------------------------------------------------
 # Oncoplot shared helpers
 # ---------------------------------------------------------------------------
 
@@ -816,6 +907,12 @@ def write_graphs(zone_summary_df, track_arrays, pair_arrays, frame_map,
         tasks[p_sync_c] = lambda p=p_sync_c: _write_sync_oncoplot(
             pair_arrays, times, sleap_idxs, track_names, fps, p, status_cb,
             show_values=False)
+
+    if _want('graph_dist_features'):
+        p_dfeat = _path("_graphs_dist_features.pdf")
+        tasks[p_dfeat] = lambda p=p_dfeat: _write_distance_feature_plot(
+            p, track_arrays, pair_arrays, frame_map, track_names,
+            node_names, fps, px_per_cm, status_cb)
 
     written = []
 

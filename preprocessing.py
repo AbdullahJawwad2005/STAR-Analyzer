@@ -305,24 +305,17 @@ def compute_kinematics(tracks, fps, sg_win=3, sg_poly=3, node_names=None):
     sg_poly = min(sg_poly, sg_win - 1)
 
     shape = (n_frames, n_nodes, n_tracks)
-    vx = np.zeros(shape, dtype=np.float32)
-    vy = np.zeros(shape, dtype=np.float32)
-    ax = np.zeros(shape, dtype=np.float32)
-    ay = np.zeros(shape, dtype=np.float32)
+    _x = tracks[:, 0, :, :]   # (n_frames, n_nodes, n_tracks)
+    _y = tracks[:, 1, :, :]
+    vx = savgol_filter(_x, sg_win, sg_poly, deriv=1, delta=dt, axis=0).astype(np.float32)
+    vy = savgol_filter(_y, sg_win, sg_poly, deriv=1, delta=dt, axis=0).astype(np.float32)
+    ax = savgol_filter(_x, sg_win, sg_poly, deriv=2, delta=dt, axis=0).astype(np.float32)
+    ay = savgol_filter(_y, sg_win, sg_poly, deriv=2, delta=dt, axis=0).astype(np.float32)
     jx = np.zeros(shape, dtype=np.float32)
     jy = np.zeros(shape, dtype=np.float32)
-
-    for t in range(n_tracks):
-        for n in range(n_nodes):
-            x = tracks[:, 0, n, t]
-            y = tracks[:, 1, n, t]
-            vx[:, n, t] = savgol_filter(x, sg_win, sg_poly, deriv=1, delta=dt)
-            vy[:, n, t] = savgol_filter(y, sg_win, sg_poly, deriv=1, delta=dt)
-            ax[:, n, t] = savgol_filter(x, sg_win, sg_poly, deriv=2, delta=dt)
-            ay[:, n, t] = savgol_filter(y, sg_win, sg_poly, deriv=2, delta=dt)
-            if sg_poly >= 3:
-                jx[:, n, t] = savgol_filter(x, sg_win, sg_poly, deriv=3, delta=dt)
-                jy[:, n, t] = savgol_filter(y, sg_win, sg_poly, deriv=3, delta=dt)
+    if sg_poly >= 3:
+        jx = savgol_filter(_x, sg_win, sg_poly, deriv=3, delta=dt, axis=0).astype(np.float32)
+        jy = savgol_filter(_y, sg_win, sg_poly, deriv=3, delta=dt, axis=0).astype(np.float32)
 
     speed   = np.hypot(vx, vy)
     heading = np.degrees(np.arctan2(vy, vx))

@@ -13,6 +13,7 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import median_filter
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +203,18 @@ def compute_single_animal(tracks, kin, node_names, fps, px_per_cm=1.0):
         walk_thr = 3.0 * px_per_cm   # px/s
         run_thr  = 20.0 * px_per_cm  # px/s
 
-        out['stationary'][:, t] = (speed < walk_thr).astype(np.int8)
-        out['walking'][:,    t] = ((speed >= walk_thr) & (speed <= run_thr)).astype(np.int8)
-        out['running'][:,    t] = (speed > run_thr).astype(np.int8)
+        raw_state = np.where(speed < walk_thr, 0,
+                    np.where(speed > run_thr, 2, 1)).astype(np.int8)
+
+        # Minimum bout duration: median-filter the state sequence to remove
+        # isolated 1–2 frame flickers (kernel = max(3, ~0.1s worth of frames),
+        # always odd).
+        kern = max(3, int(round(0.1 * fps)) | 1)  # ensure odd
+        raw_state = median_filter(raw_state, size=kern).astype(np.int8)
+
+        out['stationary'][:, t] = (raw_state == 0).astype(np.int8)
+        out['walking'][:,    t] = (raw_state == 1).astype(np.int8)
+        out['running'][:,    t] = (raw_state == 2).astype(np.int8)
 
         av = angular_velocity(heading, fps)
         out['turning'][:, t] = (np.abs(av) > 30.0).astype(np.int8)
@@ -213,11 +223,17 @@ def compute_single_animal(tracks, kin, node_names, fps, px_per_cm=1.0):
         rev  = np.zeros(n_frames, dtype=np.int8)
         half = 2
         av_abs = np.abs(av)
-        for f in range(half, n_frames - half):
-            win  = av[f - half: f + half + 1]
-            mask = av_abs[f - half: f + half + 1] > 20.0
-            if np.any(mask) and np.any(win[mask] > 0) and np.any(win[mask] < 0):
-                rev[f] = 1
+        # Use convolution to detect sign changes in window
+        above_thr = av_abs > 20.0
+        pos_above = (av > 0) & above_thr
+        neg_above = (av < 0) & above_thr
+        kernel = np.ones(2 * half + 1)
+        has_pos = np.convolve(pos_above.astype(np.float64), kernel, mode='same') > 0
+        has_neg = np.convolve(neg_above.astype(np.float64), kernel, mode='same') > 0
+        rev = (has_pos & has_neg).astype(np.int8)
+        # Zero out edges
+        rev[:half] = 0
+        rev[-half:] = 0
         out['dir_reversal'][:, t] = rev
 
     return out
@@ -248,21 +264,32 @@ def _smooth_heading_deg(pos):
 def _fill_short_gaps(arr, max_gap):
     """Fill runs of zeros ≤ max_gap frames that are flanked by ones."""
     arr = arr.copy()
-    n = len(arr)
-    i = 0
-    while i < n:
-        if arr[i] == 0:
-            j = i
-            while j < n and arr[j] == 0:
-                j += 1
-            gap   = j - i
-            left  = (i > 0) and (arr[i - 1] == 1)
-            right = (j < n) and (arr[j]     == 1)
-            if gap <= max_gap and left and right:
-                arr[i:j] = 1
-            i = j
-        else:
-            i += 1
+    if max_gap <= 0 or len(arr) < 3:
+        return arr
+    # Find transitions using diff
+    d = np.diff(arr.astype(np.int8))
+    # Gap starts: where value goes from 1 to 0 (diff == -1)
+    gap_starts = np.where(d == -1)[0] + 1  # index of first 0
+    # Gap ends: where value goes from 0 to 1 (diff == 1)
+    gap_ends = np.where(d == 1)[0] + 1  # index of first 1 after gap
+
+    if len(gap_starts) == 0 or len(gap_ends) == 0:
+        return arr
+
+    # Match each gap_start with the next gap_end
+    # Only consider gaps that are flanked by ones (start preceded by 1, end is 1)
+    ei = 0
+    for si in range(len(gap_starts)):
+        s = gap_starts[si]
+        # Find the next gap_end >= s
+        while ei < len(gap_ends) and gap_ends[ei] <= s:
+            ei += 1
+        if ei >= len(gap_ends):
+            break
+        e = gap_ends[ei]
+        gap_len = e - s
+        if gap_len <= max_gap:
+            arr[s:e] = 1
     return arr
 
 
@@ -372,36 +399,28 @@ def _retreat_projection(pos_subj, pos_target, vx_subj, vy_subj):
 def _windowed_displacement(pos, half_win):
     """Displacement over a symmetric window of ±half_win frames → (n,)."""
     n = len(pos)
-    disp = np.zeros(n)
-    for f in range(n):
-        f0 = max(0, f - half_win)
-        f1 = min(n, f + half_win + 1)
-        dx = pos[f1 - 1, 0] - pos[f0, 0]
-        dy = pos[f1 - 1, 1] - pos[f0, 1]
-        disp[f] = np.hypot(dx, dy)
-    return disp
+    # End positions (shifted forward by half_win, clamped)
+    end_idx = np.minimum(np.arange(n) + half_win, n - 1)
+    # Start positions (shifted back by half_win, clamped)
+    start_idx = np.maximum(np.arange(n) - half_win, 0)
+    dx = pos[end_idx, 0] - pos[start_idx, 0]
+    dy = pos[end_idx, 1] - pos[start_idx, 1]
+    return np.hypot(dx, dy)
 
 
 def _rolling_std(arr, half_win):
     """Rolling standard deviation with window ±half_win frames."""
-    n = len(arr)
-    out = np.zeros(n)
-    for f in range(n):
-        f0 = max(0, f - half_win)
-        f1 = min(n, f + half_win + 1)
-        seg = arr[f0:f1]
-        ok = seg[np.isfinite(seg)]
-        out[f] = float(np.std(ok)) if len(ok) > 1 else 0.0
-    return out
+    s = pd.Series(np.nan_to_num(arr, nan=0.0))
+    win = 2 * half_win + 1
+    return s.rolling(window=win, min_periods=2, center=True).std().fillna(0.0).to_numpy()
 
 
 def _gap_delta(cm_dist, half_win=2):
     """Smoothed change in inter-animal distance (positive = separating)."""
-    n = len(cm_dist)
-    delta = np.zeros(n)
-    for f in range(1, n):
-        f0 = max(0, f - half_win)
-        delta[f] = cm_dist[f] - np.mean(cm_dist[f0:f])
+    from scipy.ndimage import uniform_filter1d
+    smoothed = uniform_filter1d(cm_dist.astype(np.float64), size=half_win, mode='nearest', origin=0)
+    delta = cm_dist - smoothed
+    delta[0] = 0.0
     return delta
 
 
@@ -431,15 +450,22 @@ def _had_recent_social(pair_beh, pfx, n_frames, hist_frames, social_keys=None):
 def _path_efficiency(pos, half_win):
     """Path efficiency (displacement / path_length) over ±half_win → (n,)."""
     n = len(pos)
-    eff = np.zeros(n)
     frame_disp = np.hypot(np.diff(pos[:, 0], prepend=pos[0, 0]),
                           np.diff(pos[:, 1], prepend=pos[0, 1]))
-    for f in range(n):
-        f0 = max(0, f - half_win)
-        f1 = min(n, f + half_win + 1)
-        net = np.hypot(pos[f1 - 1, 0] - pos[f0, 0], pos[f1 - 1, 1] - pos[f0, 1])
-        total = np.sum(frame_disp[f0:f1])
-        eff[f] = (net / total) if total > 1e-12 else 0.0
+    # Cumulative sum for windowed path length
+    cumsum = np.cumsum(frame_disp)
+    padded = np.pad(cumsum, (1, 0), constant_values=0.0)
+
+    end_idx = np.minimum(np.arange(n) + half_win, n - 1) + 1  # +1 for cumsum indexing
+    start_idx = np.maximum(np.arange(n) - half_win, 0)
+    total = padded[end_idx] - padded[start_idx]
+
+    # Net displacement
+    ei = np.minimum(np.arange(n) + half_win, n - 1)
+    si = np.maximum(np.arange(n) - half_win, 0)
+    net = np.hypot(pos[ei, 0] - pos[si, 0], pos[ei, 1] - pos[si, 1])
+
+    eff = np.where(total > 1e-12, net / total, 0.0)
     return eff
 
 
@@ -484,6 +510,13 @@ def compute_pairwise(tracks, node_names, fps, dsr=None, kin=None):
 
     out   = {}
     pairs = list(combinations(range(n_tracks), 2))
+
+    _sniff_exclude_pats = ('centermass', 'bodycenter', 'bodycentre',
+                           'center_mass', 'center', 'body', 'cm', 'centroid',
+                           'tailmedial', 'tail_medial', 'tm',
+                           'tailend', 'tail_end', 'te')
+    sniff_node_idxs = [i for i, nn in enumerate(node_names)
+                       if _strip_digits(nn.lower()) not in _sniff_exclude_pats]
 
     for tA, tB in pairs:
         pfx = f't{tA}_t{tB}'
@@ -558,12 +591,6 @@ def compute_pairwise(tracks, node_names, fps, dsr=None, kin=None):
         # --- Sniff (orientation-gated nose-to-body proximity) ---
         # Sniff_AtoB: A's nose near any B node (excl CM, tail-medial, tail-end),
         #             A's heading toward B's closest node < 90deg
-        _sniff_exclude_pats = ('centermass', 'bodycenter', 'bodycentre',
-                              'center_mass', 'center', 'body', 'cm', 'centroid',
-                              'tailmedial', 'tail_medial', 'tm',
-                              'tailend', 'tail_end', 'te')
-        sniff_node_idxs = [i for i, nn in enumerate(node_names)
-                           if _strip_digits(nn.lower()) not in _sniff_exclude_pats]
 
         for subj_t, targ_t, label in [(tA, tB, 'AtoB'), (tB, tA, 'BtoA')]:
             if nose_idx is not None and body_idx is not None and sniff_node_idxs:
@@ -575,14 +602,13 @@ def compute_pairwise(tracks, node_names, fps, dsr=None, kin=None):
                     hdg_subj = _smooth_heading_deg(body_subj)
 
                 # min distance from subject nose to any target sniff-eligible node
-                min_d = np.full(n_frames, np.inf)
-                closest_pos = np.zeros((n_frames, 2))
-                for ni in sniff_node_idxs:
-                    targ_node = _node_xy(tracks, ni, targ_t)
-                    d = _dist2d(nose_subj, targ_node)
-                    closer = d < min_d
-                    min_d = np.where(closer, d, min_d)
-                    closest_pos[closer] = targ_node[closer]
+                targ_nodes = tracks[:, :, sniff_node_idxs, :][:, :, :, targ_t]  # (n_frames, 2, n_sniff)
+                nose_exp = nose_subj[:, :, np.newaxis]                            # (n_frames, 2, 1)
+                _sdiff = targ_nodes - nose_exp                                    # (n_frames, 2, n_sniff)
+                dists = np.hypot(_sdiff[:, 0, :], _sdiff[:, 1, :])               # (n_frames, n_sniff)
+                closest_ni = np.argmin(dists, axis=1)                             # (n_frames,)
+                min_d = dists[np.arange(n_frames), closest_ni]                   # (n_frames,)
+                closest_pos = targ_nodes[np.arange(n_frames), :, closest_ni]    # (n_frames, 2)
 
                 fe_sniff = _face_error(hdg_subj, body_subj, closest_pos)
                 sniff_raw = ((min_d < 0.7 * dsr) &
@@ -593,12 +619,12 @@ def compute_pairwise(tracks, node_names, fps, dsr=None, kin=None):
                 out[f'{pfx}/Sniff_{label}'] = np.zeros(n_frames, dtype=np.int8)
 
         # --- contact: any node of A within 0.25×DSR of any node of B ---
-        pA   = tracks[:, :, :, tA]   # (n_frames, 2, n_nodes)
-        pB   = tracks[:, :, :, tB]
-        diff = pA[:, :, :, np.newaxis] - pB[:, :, np.newaxis, :]
-        # diff shape: (n_frames, 2, n_nodes, n_nodes)
-        node_dists = np.hypot(diff[:, 0], diff[:, 1])  # (n_frames, n_nodes, n_nodes)
-        min_dist   = np.nanmin(node_dists, axis=(1, 2))
+        min_dist = np.full(n_frames, np.inf)
+        for _ni in range(n_nodes):
+            _node_A = tracks[:, :, _ni, tA]                          # (n_frames, 2)
+            _cdiff = _node_A[:, :, np.newaxis] - tracks[:, :, :, tB] # (n_frames, 2, n_nodes)
+            _dists = np.hypot(_cdiff[:, 0], _cdiff[:, 1])            # (n_frames, n_nodes)
+            np.minimum(min_dist, _dists.min(axis=1), out=min_dist)
         out[f'{pfx}/Contact'] = (min_dist < 0.25 * dsr).astype(np.int8)
 
         # --- relative position, co/anti-orientation, engagement ---
@@ -710,6 +736,7 @@ def compute_pairwise(tracks, node_names, fps, dsr=None, kin=None):
             ]:
                 out[f'{pfx}/{key}'] = val
 
+    out['_dsr'] = dsr  # Store for reuse by compute_second_order
     return out
 
 
@@ -874,6 +901,8 @@ def compute_second_order(tracks, kin, node_names, fps, single_beh, pair_beh,
 
     # --- DSR ---
     if dsr is None:
+        dsr = pair_beh.get('_dsr')
+    if dsr is None:
         hl = find_node_idx(node_names, 'hip_l')
         hr = find_node_idx(node_names, 'hip_r')
         dsr = compute_dsr(tracks, hl, hr)
@@ -937,14 +966,8 @@ def compute_second_order(tracks, kin, node_names, fps, single_beh, pair_beh,
         active_mask_B = spd_B > np.percentile(spd_B, 10)
         active_A = spd_A[active_mask_A] if np.any(active_mask_A) else spd_A
         active_B = spd_B[active_mask_B] if np.any(active_mask_B) else spd_B
-        p35_A = np.percentile(active_A, 35)
-        p70_A = np.percentile(active_A, 70)
-        p75_A = np.percentile(active_A, 75)
-        p95_A = np.percentile(active_A, 95)
-        p35_B = np.percentile(active_B, 35)
-        p70_B = np.percentile(active_B, 70)
-        p75_B = np.percentile(active_B, 75)
-        p95_B = np.percentile(active_B, 95)
+        p35_A, p70_A, p75_A, p95_A = np.percentile(active_A, [35, 70, 75, 95])
+        p35_B, p70_B, p75_B, p95_B = np.percentile(active_B, [35, 70, 75, 95])
 
         med_spd_A = np.median(spd_A)
         med_spd_B = np.median(spd_B)
@@ -1322,6 +1345,23 @@ def compute_second_order(tracks, kin, node_names, fps, single_beh, pair_beh,
 
     return out
 
+
+# Canonical list of first-order pairwise behavior key suffixes (without prefix)
+_PAIRWISE_BINARY_KEYS = [
+    'NoseNose', 'NoseHead_AtoB', 'NoseHead_BtoA',
+    'NoseBody_AtoB', 'NoseBody_BtoA',
+    'NoseRear_AtoB', 'NoseRear_BtoA',
+    'Contact', 'CoOriented', 'AntiOriented',
+    'HH', 'HO', 'Sniff_AtoB', 'Sniff_BtoA',
+]
+
+# Engagement-masked speed key suffixes (without pair prefix)
+_ENGAGE_SPEED_KEYS = [
+    'EngageSpeed_A', 'EngageSpeed_B',
+    'DisengageSpeed_A', 'DisengageSpeed_B',
+    'EngageOnsetSpeed_A', 'EngageOnsetSpeed_B',
+    'DisengageOnsetSpeed_A', 'DisengageOnsetSpeed_B',
+]
 
 # Canonical list of second-order behavior key suffixes (without pair prefix)
 _SECOND_ORDER_KEYS = [

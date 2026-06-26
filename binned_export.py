@@ -33,6 +33,7 @@ then recomputed from those bin-level bout lists.
 
 from __future__ import annotations
 
+import bisect
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -45,6 +46,9 @@ from behaviors import (
     _find_bouts,
     _mean_approach_angle_arr,
     _indices_from_bouts,
+    _PAIRWISE_BINARY_KEYS,
+    _SECOND_ORDER_BINARY_KEYS,
+    _ENGAGE_SPEED_KEYS,
 )
 
 
@@ -490,6 +494,9 @@ def build_025s_bins(track_arrays: dict,
     bin_list = list(bins.items())
     n_bins   = len(bin_list)
 
+    # Pre-build numpy index arrays once per bin (avoids repeated np.array() calls)
+    bin_idx_arrays = [np.array(sleap_idxs, dtype=int) for _, sleap_idxs in bin_list]
+
     # Body-centre node for covariance re-computation and approach angles
     body_idx = find_node_idx(node_names, 'body')
 
@@ -533,9 +540,9 @@ def build_025s_bins(track_arrays: dict,
     # Animal 0.25 s bins
     # ────────────────────────────────────────────────────────────────────────
     animal_rows = []
-    for bin_idx, sleap_idxs in bin_list:
+    for bi, (bin_idx, sleap_idxs) in enumerate(bin_list):
         bin_time = round(bin_idx * bin_size_s, 4)
-        idx_arr  = np.array(sleap_idxs, dtype=int)
+        idx_arr  = bin_idx_arrays[bi]
 
         for t, tname in enumerate(track_names):
             row: dict = {'BinIdx': bin_idx, 'BinTime(s)': bin_time, 'Track': tname}
@@ -563,9 +570,9 @@ def build_025s_bins(track_arrays: dict,
     pair_rows = []
 
     if pair_col_cats:
-        for bin_idx, sleap_idxs in bin_list:
+        for bi, (bin_idx, sleap_idxs) in enumerate(bin_list):
             bin_time = round(bin_idx * bin_size_s, 4)
-            idx_arr  = np.array(sleap_idxs, dtype=int)
+            idx_arr  = bin_idx_arrays[bi]
 
             for pfx, (tA, tB, nA, nB) in pair_pfx_map.items():
                 if pfx not in pair_col_cats:
@@ -597,26 +604,8 @@ def build_025s_bins(track_arrays: dict,
                     row['pos_correlation_y_bin'] = corr_y
 
                 # ── Pair behavior proportions ───────────────────────────────
-                # WARNING: this proximity behavior list is hardcoded here and must be
-                # kept in sync with the behavior types produced by compute_pairwise() in
-                # behaviors.py.  If a new proximity behavior key is added to that function,
-                # it must also be added to this list for it to appear in the binned export.
                 denom = max(n_expected, len(idx_arr))
-                for bk in ('NoseNose', 'NoseHead_AtoB', 'NoseHead_BtoA',
-                            'NoseBody_AtoB', 'NoseBody_BtoA',
-                            'NoseRear_AtoB', 'NoseRear_BtoA',
-                            'Contact', 'CoOriented', 'AntiOriented',
-                            'HH', 'HO', 'Sniff_AtoB', 'Sniff_BtoA',
-                            'Follow_AtoB', 'Follow_BtoA',
-                            'Chase_AtoB', 'Chase_BtoA',
-                            'Flee_AtoB', 'Flee_BtoA',
-                            'Approach_AtoB', 'Approach_BtoA',
-                            'ActiveAvoid_AtoB', 'ActiveAvoid_BtoA',
-                            'PassiveAvoid_AtoB', 'PassiveAvoid_BtoA',
-                            'StationaryProx',
-                            'SocialOrient_AtoB', 'SocialOrient_BtoA',
-                            'VisualAttn_AtoB', 'VisualAttn_BtoA',
-                            'AuditoryAttn_AtoB', 'AuditoryAttn_BtoA'):
+                for bk in _PAIRWISE_BINARY_KEYS + _SECOND_ORDER_BINARY_KEYS:
                     full_key = f'{pfx}/{bk}'
                     if full_key in pair_beh:
                         vals = pair_beh[full_key][idx_arr].astype(np.float64)
@@ -633,15 +622,7 @@ def build_025s_bins(track_arrays: dict,
                 row['Disengaged_prop'] = float(dis_vals.sum() / denom)
 
                 # ── Engagement-masked speeds: median of non-NaN values ──────
-                # WARNING: the engagement speed column names are hardcoded here.
-                # If behaviors.py adds new engagement speed variants (e.g. per-node
-                # engagement speeds or additional onset/offset variants), those new
-                # column names must also be added to this list to be included in the
-                # binned export.
-                for sk in ('EngageSpeed_A', 'EngageSpeed_B',
-                            'DisengageSpeed_A', 'DisengageSpeed_B',
-                            'EngageOnsetSpeed_A', 'EngageOnsetSpeed_B',
-                            'DisengageOnsetSpeed_A', 'DisengageOnsetSpeed_B'):
+                for sk in _ENGAGE_SPEED_KEYS:
                     full_sk = f'{pfx}/{sk}'
                     if full_sk in pair_beh:
                         v    = pair_beh[full_sk][idx_arr]
@@ -676,8 +657,8 @@ def build_025s_bins(track_arrays: dict,
             # engagement count.  Adjust the > 0.5 threshold here if a more or less
             # conservative criterion is needed.
             engaged_bin = np.zeros(n_bins, dtype=np.int8)
-            for bi, (_, s_idxs) in enumerate(bin_list):
-                idx_a = np.array(s_idxs, dtype=int)
+            for bi in range(n_bins):
+                idx_a = bin_idx_arrays[bi]
                 denom_e = max(n_expected, len(idx_a))
                 prop  = float(eng_arr[idx_a].sum()) / denom_e
                 engaged_bin[bi] = 1 if prop > 0.5 else 0
@@ -706,15 +687,18 @@ def build_025s_bins(track_arrays: dict,
             else:
                 max_min = 0
 
+            # Pre-sort bouts by start time for O(log n) per-minute filtering
+            sorted_bouts = sorted(bouts, key=lambda b: bin_start_times[b['start']])
+            sorted_bout_starts = [bin_start_times[b['start']] for b in sorted_bouts]
+
             for m in range(1, max_min + 1):
                 t_lo = (m - 1) * 60.0
                 t_hi = m * 60.0
 
-                # Filter bouts by their bout-start bin's video time
-                bouts_per = [b for b in bouts
-                             if t_lo <= bin_start_times[b['start']] < t_hi]
-                bouts_cum = [b for b in bouts
-                             if bin_start_times[b['start']] < t_hi]
+                lo_i = bisect.bisect_left(sorted_bout_starts, t_lo)
+                hi_i = bisect.bisect_left(sorted_bout_starts, t_hi)
+                bouts_per = sorted_bouts[lo_i:hi_i]
+                bouts_cum = sorted_bouts[:hi_i]
 
                 if bouts_per:
                     idx_per = _indices_from_bouts(bouts_per, fps=bin_fps, retreat_window_s=3.0)
@@ -813,7 +797,6 @@ def build_1s_from_025(animal_025: pd.DataFrame,
         if df.empty:
             return df.copy()
 
-        df = df.copy()
         # Assign each 0.25 s bin to the parent 1 s bin index
         df['_1s_bin'] = (df['BinIdx'] // bins_per_s).astype(int)
         # Compute 1 s bin start time for the output column
@@ -833,30 +816,28 @@ def build_1s_from_025(animal_025: pd.DataFrame,
         mean_cols  = [c for c in feat_cols if _1s_agg_rule(c) == 'mean']
         # 'skip' columns are simply never added to the output
 
-        rows = []
-        for keys, chunk in df.groupby(group_keys, sort=False):
-            if not isinstance(keys, tuple):
-                keys = (keys,)
-            row: dict = dict(zip(group_keys, keys))
-            row['BinTime_1s(s)'] = float(keys[0])   # first key is _1s_bin index
+        grouped = df.groupby(group_keys, sort=False)
 
-            # Arithmetic mean: covers position means, distance mean/median,
-            # velocity median/p95, acceleration, jerk, shape, covariance, …
-            for col in mean_cols:
-                vals = chunk[col].to_numpy(dtype=np.float64)
-                ok   = vals[np.isfinite(vals)]
-                row[col] = float(np.mean(ok)) if len(ok) > 0 else np.nan
+        # Arithmetic mean columns: use groupby.mean() for all at once
+        # (pandas mean already skips NaN by default)
+        if mean_cols:
+            result_mean = grouped[mean_cols].mean()
+        else:
+            result_mean = pd.DataFrame(index=grouped.indices.keys())
 
-            # Circular mean: applied to sub-bin circular means (*_cmean columns).
-            # These are already angle values in [−180°, 180°] so they can be
-            # passed directly into _circular_mean_deg.
+        # Circular mean columns: must be done per-column
+        if cmean_cols:
+            cmean_data = {}
             for col in cmean_cols:
-                vals = chunk[col].to_numpy(dtype=np.float64)
-                row[col] = _circular_mean_deg(vals)
+                cmean_data[col] = grouped[col].apply(
+                    lambda s: _circular_mean_deg(s.to_numpy()))
+            result_cmean = pd.DataFrame(cmean_data)
+        else:
+            result_cmean = pd.DataFrame(index=result_mean.index)
 
-            rows.append(row)
-
-        result = pd.DataFrame(rows).drop(columns=['_1s_bin'], errors='ignore')
+        result = pd.concat([result_mean, result_cmean], axis=1).reset_index()
+        result['BinTime_1s(s)'] = result['_1s_bin'].astype(float)
+        result = result.drop(columns=['_1s_bin'], errors='ignore')
         return result
 
     animal_1s = _derive(animal_025, id_cols=['BinIdx', 'BinTime(s)', 'Track'])
