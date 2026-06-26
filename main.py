@@ -2,11 +2,23 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from main_window import MainWindow
+from main_window import MainWindow, _make_star_icon
 
 
 def main():
+    # Windows: register our own App User Model ID so the taskbar shows our
+    # icon instead of the generic Python icon.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "wanglabs.STARAnalyzer.1.0"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setWindowIcon(_make_star_icon())
     window = MainWindow()
     window.show()
     window._center_on_screen()

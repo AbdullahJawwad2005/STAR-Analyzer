@@ -1178,7 +1178,7 @@ class RunPopUp(QWidget):
         self.setStyleSheet("""
             QWidget { background:#1a1a1a; color:#ccc; font:13px 'Segoe UI',sans-serif; }
             QPushButton { background:#2d2d2d; color:#eee; border:1px solid #444;
-                          border-radius:4px; padding:6px 12px; min-width:70px; }
+                          border-radius:4px; padding:6px 10px; min-width:54px; }
             QPushButton:hover  { background:#3d3d3d; }
             QPushButton:pressed{ background:#1f1f1f; }
             QSlider::groove:horizontal { height:4px; background:#444; border-radius:2px; }

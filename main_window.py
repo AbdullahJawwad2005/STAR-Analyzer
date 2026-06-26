@@ -1,9 +1,8 @@
 import gc
 import cv2
 
-from PySide6.QtCore import Qt, QDateTime
-from PySide6.QtGui import QGuiApplication, QFont, QIcon, QPixmap, QPainter, QPen, QBrush, QColor, QPolygonF
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import Qt, QDateTime, QPointF, QRectF
+from PySide6.QtGui import QGuiApplication, QFont, QIcon, QPixmap, QPainter, QPen, QBrush, QColor
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -23,26 +22,49 @@ from run_popup import RunPopUp
 from sleap_loader import load_sleap
 
 
-def _make_star_icon() -> QIcon:
-    """Create a 32x32 star icon for the STAR Analyzer main window."""
+def _make_star_icon(size: int = 32) -> QIcon:
+    """Create a multi-resolution SLEAP-skeleton icon in Augusta University colors."""
     import math
-    px = QPixmap(32, 32)
-    px.fill(QColor(0, 0, 0, 0))
-    p = QPainter(px)
-    p.setRenderHint(QPainter.Antialiasing)
-    # 5-pointed star
-    cx, cy, r_out, r_in = 16, 16, 14, 6
-    points = []
-    for i in range(10):
-        angle = math.radians(-90 + i * 36)
-        r = r_out if i % 2 == 0 else r_in
-        points.append(QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle)))
-    poly = QPolygonF(points)
-    p.setPen(QPen(QColor(31, 111, 139), 1))
-    p.setBrush(QBrush(QColor(31, 111, 139)))
-    p.drawPolygon(poly)
-    p.end()
-    return QIcon(px)
+
+    icon = QIcon()
+    for sz in ([size] if size != 32 else [16, 32, 48, 64]):
+        px = QPixmap(sz, sz)
+        px.fill(QColor(0, 0, 0, 0))
+        p = QPainter(px)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Dark navy-teal background (rounded square)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(0x15, 0x25, 0x35)))
+        r = sz * 0.18
+        p.drawRoundedRect(QRectF(0, 0, sz, sz), r, r)
+
+        # Node positions: head (top-center), left-body, right-body
+        cx = sz / 2.0
+        head  = QPointF(cx,           sz * 0.22)
+        left  = QPointF(cx - sz*0.28, sz * 0.78)
+        right = QPointF(cx + sz*0.28, sz * 0.78)
+
+        # Augusta green skeleton lines
+        pen = QPen(QColor(0x00, 0x79, 0x32))
+        pen.setWidthF(max(1.5, sz * 0.065))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawLine(head, left)
+        p.drawLine(head, right)
+        p.drawLine(left, right)
+
+        # Augusta gold tracking nodes
+        node_r = max(1.8, sz * 0.115)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(0xFF, 0xB8, 0x1C)))
+        for node in (head, left, right):
+            p.drawEllipse(node, node_r, node_r)
+
+        p.end()
+        icon.addPixmap(px)
+
+    return icon
 
 
 class MainWindow(QMainWindow):
