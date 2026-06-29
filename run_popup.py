@@ -460,7 +460,8 @@ class _ExportWorker(QObject):
                 info_df = pd.DataFrame(info_rows, columns=["Parameter", "Value"])
 
                 # ---- Write main xlsx (only if at least one main sheet selected) ----
-                any_main = any(self._want(k) for k, _ in ExportOptionsDialog._MAIN_SHEETS)
+                any_main = any(self._want(k) for k, _ in ExportOptionsDialog._MAIN_SHEETS
+                               if k != "main_key_metrics")
                 if any_main:
                     self.status.emit("Writing Excel workbook…")
                     with pd.ExcelWriter(path, engine="openpyxl") as writer:
