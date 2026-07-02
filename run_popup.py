@@ -714,6 +714,7 @@ class ExportOptionsDialog(QDialog):
     def __init__(self, graphs_available=True, default_dir="", default_name="export",
                  proc_opts=None, parent=None):
         super().__init__(parent)
+        self._updating = False   # guard against recursive signal loops — must be set before any widget creation
         self.setWindowTitle("Export Options")
         self.setWindowIcon(_make_icon("export"))
         self.setMinimumWidth(420)
@@ -825,8 +826,6 @@ class ExportOptionsDialog(QDialog):
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
-
-        self._updating = False   # guard against recursive signal loops
 
         # Connect all checkboxes + name edit to preview updater
         for cb in self._checks.values():

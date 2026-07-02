@@ -495,7 +495,30 @@ beyond the scope of this derived table.
 
 ### What it does
 The single Qt window. Manages video playback, ROI drawing, data loading, overlay rendering,
-the data inspector popup, and two QThread workers.
+the data inspector popup, two QThread workers, and the processing/export option dialogs.
+
+### `ProcessingOptionsDialog`
+
+Shown immediately before each Process run. Presents checkboxes:
+
+| Option | Key | What it gates |
+|--------|-----|--------------|
+| Single-animal behaviors | `proc_single_beh` | `compute_single_animal` |
+| Feature arrays | `proc_features` | `precompute_feature_arrays` |
+| Zone analysis | `proc_zones` | Center/Perimeter/Corner classification |
+| Pair / social behaviors | `proc_pair_beh` | `compute_pairwise` + `compute_second_order` |
+| Proximity tracking | `proc_proximity` | inter-animal distance bout precomputes |
+
+The pair group is **auto-disabled** when `n_tracks < 2`. The dialog result is stored in
+`self._proc_opts` and persists across re-runs within the same session. Kinematics
+(`compute_kinematics`) are always computed regardless of options.
+
+### `ExportOptionsDialog`
+
+Receives `proc_opts` from `_analysis_cache['proc_opts']` (or `None`). Uses a `_PROC_GATES`
+mapping to automatically uncheck and disable export outputs whose upstream module was
+not computed. For example, if `proc_pair_beh=False`, pair behavior sheets and pair graph
+PDFs are greyed out.
 
 ### Two QThread workers
 
@@ -505,15 +528,19 @@ the data inspector popup, and two QThread workers.
 - Emits `finished(processed_data_dict)` when done.
 
 **`_ExportWorker`** — runs after the user clicks "Export" and chooses a file path:
-- Takes all data needed for the full export pipeline.
-- Runs in this order: `compute_kinematics` → `compute_single_animal` → `compute_pairwise` →
-  `compute_behavior_summary` → `precompute_feature_arrays` → `build_feature_dataframes` →
+- Takes `analysis_cache` (the dict built by `_precompute_analysis`) plus calibration/ROI args.
+- **Does NOT recompute kinematics, behaviors, or features.** Pulls everything from cache:
+  `tracks`, `frame_map`, `node_names`, `track_names`, `kin`, `single_beh`, `pair_beh`,
+  `track_feat`, `pair_feat`, `zone_label`, `proc_opts`.
+- Only new computation in `run()` is `compute_second_order` (export-only compound behaviors,
+  called only if `proc_pair_beh=True`).
+- Runs in this order: pull from cache → `compute_second_order` (if applicable) →
+  `compute_behavior_summary` → `build_feature_dataframes` (reusing cached arrays) →
   build main data table → build behavior DataFrame → write main `.xlsx` →
   `build_key_metrics_df` + `build_proximity_orientation_df` → write `_key_metrics.xlsx` →
   `write_binned_xlsx`.
 - Emits `finished(success_msg_str)` or `error(traceback_str)`.
-- Note: the `status` signal (for label updates) is defined but not currently connected to
-  any UI widget. It could be wired to a status label in a future UI update.
+- Note: the `status` signal is defined but not currently connected to any UI widget.
 
 **Important:** The Qt file-save dialog must run on the main thread (Qt restriction). In
 `_run_export`, the dialog is shown before the worker is created. The path is then passed
@@ -541,19 +568,20 @@ the correct pattern for preventing Qt memory leaks.
 
 ### `_ExportWorker.run` computation order
 
-1. Unpack ROI and calibration from constructor args.
-2. `compute_kinematics(tracks, fps)` — SG differentiation.
-3. `compute_single_animal(...)` — locomotor states.
-4. `compute_pairwise(...)` — social behaviors (DSR auto-computed from hip nodes or fallback).
-5. `compute_behavior_summary(...)` — session stats + windowed EI/RI/RTI.
-6. `precompute_feature_arrays(...)` — all feature arrays (once for both main and binned).
-7. `build_feature_dataframes(..., _precomputed=...)` — assembles Animal/Pair Feature DataFrames.
-8. Python loop builds per-row main tracking DataFrame (kinematic values in cm units).
-9. Python loop builds per-row behavior DataFrame.
-10. `.xlsx` write with `pd.ExcelWriter`.
-11. `build_key_metrics_df(...)` + optionally `build_proximity_orientation_df(...)` → write `_key_metrics.xlsx`.
-12. `write_binned_xlsx(...)` — binned Excel workbook.
-13. Emit `finished(msg)`.
+1. Pull `tracks`, `kin`, `single_beh`, `pair_beh`, `track_feat`, `pair_feat`,
+   `zone_label`, `proc_opts` from `self._cache`.
+2. If `proc_pair_beh=True`: `compute_second_order(...)` — compound social behaviors;
+   merged into `pair_beh` copy (does not mutate cache).
+3. `compute_behavior_summary(...)` — session stats + windowed EI/RI/RTI.
+4. If `track_feat` is non-empty and `proc_features=True`:
+   `build_feature_dataframes(..., _precomputed=(track_feat, pair_feat))`.
+   Otherwise sets `animal_feat_df = pair_feat_df = pd.DataFrame()`.
+5. Python loop builds per-row main tracking DataFrame (kinematic values in cm units).
+6. Python loop builds per-row behavior DataFrame.
+7. `.xlsx` write with `pd.ExcelWriter`.
+8. `build_key_metrics_df(...)` + optionally `build_proximity_orientation_df(...)` → write `_key_metrics.xlsx`.
+9. `write_binned_xlsx(...)` — binned Excel workbook.
+10. Emit `finished(msg)`.
 
 ### Zone classification
 
@@ -575,22 +603,39 @@ C2 = (rx1-strip, ry0, rx1, ry0+strip)  # top-right corner
 
 ### `_precompute_analysis` vs `_run_export`
 
-`_precompute_analysis` is called after Process completes and caches data for the live
-overlay and data inspector popup. It also runs `compute_kinematics` and all behavior/feature
-computation — **independently from `_run_export`**. This means the heavy computation runs
-twice: once for the overlay cache and once for export.
+`_precompute_analysis(proc_opts=None)` is called after Process completes. It:
+1. Trims the first 5 seconds from `tracks` and adjusts `frame_map`.
+2. Always runs `compute_kinematics`.
+3. Conditionally runs each module based on `proc_opts` flags.
+4. Builds `self._analysis_cache` — a dict containing all computed results plus `proc_opts`.
 
-This duplication is intentional (the overlay needs data immediately after processing;
-export only runs on user request). However, it means any change to behavior/feature
-computation must be made in both `_precompute_analysis` and `_ExportWorker.run`.
+`_ExportWorker` receives this cache directly and **reuses it without recomputing**.
+The cache is the single source of truth for both the live overlay and the export pipeline.
+
+`_analysis_cache` keys:
+
+| Key | Type | Notes |
+|-----|------|-------|
+| `tracks` | `ndarray` | Trimmed (first 5 s removed) |
+| `frame_map` | `dict` | Adjusted to trimmed indices |
+| `node_names` | `list[str]` | |
+| `track_names` | `list[str]` | |
+| `kin` | `dict` | Output of `compute_kinematics` |
+| `single_beh` | `dict` | Empty `{}` if `proc_single_beh=False` |
+| `pair_beh` | `dict` | Empty `{}` if `proc_pair_beh=False` or `n_tracks < 2` |
+| `track_feat` | `dict` | Empty `{}` if `proc_features=False` |
+| `pair_feat` | `dict` | Empty `{}` if `proc_features=False` |
+| `zone_label` | `dict` | Empty `{}` if `proc_zones=False` |
+| `body_idx` | `int\|None` | Body-centre node index |
+| `proc_opts` | `dict` | The resolved option flags |
 
 ### Things to check
-- `_precompute_analysis` runs on the main thread (it's called directly from
-  `_on_process_done` which is a slot). For large sessions this could stutter the UI briefly.
-  It is not wrapped in a QThread. This is a known limitation.
+- `_precompute_analysis` runs on the main thread (called from `_on_process_done`, a slot).
+  For large sessions this could stutter the UI briefly. It is not wrapped in a QThread.
+  This is a known limitation.
 - The `_ExportWorker.status` signal is defined but not connected to any UI widget. The
   progress bar is in indeterminate (marquee) mode during export. If users want step-by-step
-  status updates ("Computing kinematics…", "Writing Excel…"), `status` would need to be
+  status updates ("Computing behavior summary…", "Writing Excel…"), `status` would need to be
   connected to a `QLabel` in `_run_export`.
 - `closeEvent` stops the timer and releases the cv2 capture. It does NOT explicitly stop
   or wait for a running export thread. If the window is closed mid-export, the thread will
@@ -598,17 +643,40 @@ computation must be made in both `_precompute_analysis` and `_ExportWorker.run`.
   dialog will be emitted to a destroyed object. Qt's signal/slot mechanism handles
   this gracefully (deleted receiver is disconnected), but the file being written may be
   incomplete. Users should be warned not to close the window during export.
-- `_analysis_cache` is a dict with keys `tracks`, `kin`, `single_beh`, `pair_beh`,
-  `track_feat`, `pair_feat`, `body_idx`, `node_names`, `track_names`, `frame_map`,
-  `px_per_cm`. Access is unguarded in `_draw_analysis_overlay` and `_data_popup.refresh`.
-  If `_precompute_analysis` fails silently (e.g. an exception), `_analysis_cache` may be
-  `None` and cause `AttributeError` downstream. There is a `if self._analysis_cache is not None`
-  guard before overlay/popup calls, which covers the case where analysis never ran, but not
-  the case where it ran and populated partial data.
+- `_analysis_cache` access is unguarded in `_draw_analysis_overlay` and `_DataPopup.refresh`.
+  There is a `if self._analysis_cache is not None` guard before overlay/popup calls (covers
+  the "never ran" case), but not the case where `_precompute_analysis` ran and populated
+  only partial data due to an exception mid-run.
+- `_DataPopup.setup()` guards `single_beh[bk]` with `if bk not in single_beh: continue`
+  to handle the case where `proc_single_beh=False`. The same guard does **not** exist for
+  pair behavior rows — if a pair behavior key is expected but absent (e.g. because
+  `proc_pair_beh=False`), the popup will silently skip it only if `_DataPopup.setup()` also
+  has a similar guard for pair keys. Verify this is consistent.
+- If the user clicks Process a second time without changing `proc_opts`, the same options
+  dialog re-appears. `_proc_opts` is preserved across runs so the checkboxes will be in
+  the same state as the previous run. This is intentional and documented in the README.
+- `_on_arena_cm_changed` calls `_precompute_analysis(proc_opts=getattr(self, '_proc_opts', None))`.
+  If the user changes arena size before ever clicking Process, `_proc_opts` does not exist
+  yet and `getattr` returns `None`, meaning all modules run. This is safe but means an
+  arena-size-triggered recompute always runs all modules regardless of prior `_proc_opts`.
 
 ---
 
 ## 9. Cross-Cutting Issues and Design Trade-offs
+
+### Issue 0: Selective processing and export gating (new)
+`ProcessingOptionsDialog` allows skipping expensive modules. The `_PROC_GATES` dict in
+`ExportOptionsDialog` maps each export checkbox to the `proc_opts` keys it depends on.
+If a dependency was not computed, the export checkbox is unchecked and disabled.
+
+**What to verify:** The `_PROC_GATES` mapping is hardcoded. If a new export option is added
+to `ExportOptionsDialog`, its dependencies must be manually added to `_PROC_GATES`. There
+is no runtime check that the mapping is complete.
+
+**What changed:** Previously `_ExportWorker` recomputed kinematics + all behaviors +
+all features from scratch on every export, independently from `_precompute_analysis`.
+This is no longer the case — the cache is the single source of truth. Any change to
+behavior or feature computation now only needs to be made in `_precompute_analysis`.
 
 ### Issue 1: Session-relative speed thresholds
 Speed thresholds (`p15`, `p75` percentiles per animal) are computed from each animal's own
@@ -786,6 +854,13 @@ Use this as a structured checklist when reading through the code:
       is ever called? (The `if self._analysis_cache is not None` guard covers the
       uncomputed case; the overlay is only drawn in `_show_frame` after `_precompute_analysis`
       has run)
+- [ ] Is `self._updating = False` set in `ExportOptionsDialog.__init__` **before** any
+      widget or group is created? (Checkboxes fire `stateChanged` synchronously on
+      `setChecked(True)` during construction, which calls `_sync_group` before `_updating`
+      would be set if it were placed at the end of `__init__`.)
+- [ ] Does `_PROC_GATES` in `ExportOptionsDialog` cover every export option that depends
+      on a selective processing module? Any new export option must be manually added here.
+- [ ] Does `ProcessingOptionsDialog` correctly disable the pair group when `n_tracks < 2`?
 
 ---
 
