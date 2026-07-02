@@ -37,7 +37,9 @@ from preprocessing import fill_and_smooth_tracks, compute_kinematics
 from behaviors import (compute_single_animal, compute_pairwise, compute_behavior_summary,
                        compute_second_order, _SECOND_ORDER_KEYS, find_node_idx)
 from features import (build_feature_dataframes, precompute_feature_arrays,
-                      build_key_metrics_df, build_proximity_orientation_df)
+                      build_key_metrics_df, build_proximity_orientation_df,
+                      _tailend_node_idxs, _detect_bouts, _general_min_dist,
+                      PROX_THRESHOLD_CM, CONTACT_THRESHOLD_CM)
 from binned_export import write_binned_xlsx
 from roi_view import ROIView
 try:
@@ -195,12 +197,12 @@ class _ExportWorker(QObject):
     error    = Signal(str)
     status   = Signal(str)
 
-    def __init__(self, processed_data, fps, roi, arena_cm, strip_cm, path,
+    def __init__(self, analysis_cache, fps, roi, arena_cm, strip_cm, path,
                  arena_snapshot=None, export_opts=None):
         """
         Parameters
         ----------
-        processed_data : dict   — the smoothed SLEAP data dict (from _ProcessWorker)
+        analysis_cache : dict   — from _precompute_analysis (already trimmed, kinematics computed)
         fps            : float  — video frame rate
         roi            : tuple  — ((rx0,ry0),(rx1,ry1), side) from view.roi_native()
         arena_cm       : int    — arena size in cm (from spin box)
@@ -210,7 +212,7 @@ class _ExportWorker(QObject):
         export_opts    : dict[str,bool] or None — from ExportOptionsDialog.options(); None = all
         """
         super().__init__()
-        self._data      = processed_data
+        self._cache     = analysis_cache
         self._fps       = fps
         self._roi       = roi
         self._arena_cm  = arena_cm
@@ -234,53 +236,41 @@ class _ExportWorker(QObject):
             inv_ppcm  = 1.0 / px_per_cm
             path      = self._path
 
-            tracks      = self._data["tracks"]
-            frame_map   = self._data["frame_map"]
-            node_names  = self._data["node_names"]
-            track_names = self._data["track_names"]
+            # ---- Pull from cache (already trimmed by _precompute_analysis) ----
+            tracks       = self._cache['tracks']
+            frame_map    = self._cache['frame_map']
+            node_names   = self._cache['node_names']
+            track_names  = self._cache['track_names']
+            kin          = self._cache['kin']
+            single_beh   = self._cache.get('single_beh', {})
+            pair_beh     = dict(self._cache.get('pair_beh', {}))   # copy; will add second_order
+            track_arrays = self._cache.get('track_feat', {})
+            pair_arrays  = self._cache.get('pair_feat', {})
+            zone_label   = self._cache.get('zone_label')
+            po           = self._cache.get('proc_opts', {})
 
-            # ---- Trim first 15 seconds (hand placement buffer) ----
-            n_frames = tracks.shape[0]
-            analysis_start = min(int(15 * self._fps), n_frames)
-            self.status.emit(
-                f"Trimming first 15s ({analysis_start} frames); "
-                f"analysis starts at frame {analysis_start}")
-            tracks = tracks[analysis_start:]
-            frame_map = {vf: si - analysis_start
-                         for vf, si in frame_map.items()
-                         if si >= analysis_start}
+            # ---- 2nd-order compound social behaviors (export-only) ----
+            if pair_beh and po.get('proc_pair_beh', True):
+                self.status.emit("Detecting 2nd-order behaviors…")
+                second_order = compute_second_order(
+                    tracks, kin, node_names, self._fps, single_beh, pair_beh)
+                pair_beh.update(second_order)
 
-            # ---- Kinematics ----
-            self.status.emit("Computing kinematics…")
-            kin = compute_kinematics(tracks, self._fps, node_names=node_names)
-
-            # ---- Behavior detection ----
-            self.status.emit("Detecting behaviors…")
-            single_beh  = compute_single_animal(tracks, kin, node_names, self._fps,
-                                                   px_per_cm=px_per_cm)
-            pair_beh    = compute_pairwise(tracks, node_names, self._fps, dsr=None, kin=kin)
-
-            # Second-order compound social behaviors
-            self.status.emit("Detecting 2nd-order behaviors…")
-            second_order = compute_second_order(
-                tracks, kin, node_names, self._fps, single_beh, pair_beh)
-            pair_beh.update(second_order)
-
+            # ---- Behavior summary ----
             beh_summary, engagement_idx_df = compute_behavior_summary(
                 single_beh, pair_beh, track_names, self._fps,
                 tracks=tracks, kin=kin, frame_map=frame_map, node_names=node_names)
 
-            # ---- Primitive & derivative features ----
-            # Compute arrays once; pass to both the full DataFrame builder and the
-            # binned export so the heavy feature computation runs only once.
-            self.status.emit("Computing features…")
-            track_arrays, pair_arrays = precompute_feature_arrays(
-                tracks, kin, node_names, self._fps, roi=(rx0, ry0, rx1, ry1))
-            animal_feat_df, pair_feat_df = build_feature_dataframes(
-                tracks, kin, node_names, track_names, self._fps,
-                frame_map, roi=(rx0, ry0, rx1, ry1),
-                _precomputed=(track_arrays, pair_arrays),
-            )
+            # ---- Feature DataFrames (reuse precomputed arrays from cache) ----
+            if track_arrays and po.get('proc_features', True):
+                self.status.emit("Building feature dataframes…")
+                animal_feat_df, pair_feat_df = build_feature_dataframes(
+                    tracks, kin, node_names, track_names, self._fps,
+                    frame_map, roi=(rx0, ry0, rx1, ry1),
+                    _precomputed=(track_arrays, pair_arrays),
+                )
+            else:
+                animal_feat_df = pair_feat_df = pd.DataFrame()
 
             # ---- Build main data table ----
             self.status.emit("Building data table…")
@@ -464,25 +454,30 @@ class _ExportWorker(QObject):
                                if k != "main_key_metrics")
                 if any_main:
                     self.status.emit("Writing Excel workbook…")
-                    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                        if self._want("main_tracking_data"):
-                            df.to_excel(writer,              sheet_name="Tracking Data",        index=False)
-                        if self._want("main_zone_summary"):
-                            summary.to_excel(writer,         sheet_name="Zone Summary",         index=False)
-                        if self._want("main_session_info"):
-                            info_df.to_excel(writer,         sheet_name="Session Info",         index=False)
-                        if self._want("main_1st_order_behaviors"):
-                            beh_df.to_excel(writer,          sheet_name="1st Order Behaviors",  index=False)
-                        if self._want("main_2nd_order_behaviors") and not beh2_df.empty:
-                            beh2_df.to_excel(writer,     sheet_name="2nd Order Behaviors", index=False)
-                        if self._want("main_behavior_summary"):
-                            beh_summary.to_excel(writer,     sheet_name="Behavior Summary",     index=False)
-                        if self._want("main_engagement_indices") and not engagement_idx_df.empty:
-                            engagement_idx_df.to_excel(writer, sheet_name="Engagement Indices", index=False)
-                        if self._want("main_animal_features"):
-                            animal_feat_df.to_excel(writer,  sheet_name="Animal Features",      index=False)
-                        if self._want("main_pair_features") and not pair_feat_df.empty:
-                            pair_feat_df.to_excel(writer, sheet_name="Pair Features",       index=False)
+                    try:
+                        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                            if self._want("main_tracking_data"):
+                                df.to_excel(writer,              sheet_name="Tracking Data",        index=False)
+                            if self._want("main_zone_summary"):
+                                summary.to_excel(writer,         sheet_name="Zone Summary",         index=False)
+                            if self._want("main_session_info"):
+                                info_df.to_excel(writer,         sheet_name="Session Info",         index=False)
+                            if self._want("main_1st_order_behaviors"):
+                                beh_df.to_excel(writer,          sheet_name="1st Order Behaviors",  index=False)
+                            if self._want("main_2nd_order_behaviors") and not beh2_df.empty:
+                                beh2_df.to_excel(writer,     sheet_name="2nd Order Behaviors", index=False)
+                            if self._want("main_behavior_summary"):
+                                beh_summary.to_excel(writer,     sheet_name="Behavior Summary",     index=False)
+                            if self._want("main_engagement_indices") and not engagement_idx_df.empty:
+                                engagement_idx_df.to_excel(writer, sheet_name="Engagement Indices", index=False)
+                            if self._want("main_animal_features"):
+                                animal_feat_df.to_excel(writer,  sheet_name="Animal Features",      index=False)
+                            if self._want("main_pair_features") and not pair_feat_df.empty:
+                                pair_feat_df.to_excel(writer, sheet_name="Pair Features",       index=False)
+                    except PermissionError:
+                        raise PermissionError(
+                            f"Cannot write '{Path(path).name}' — close it in Excel and try again."
+                        )
                 # ---- Key Metrics separate file (*_key_metrics.xlsx) ----
                 if self._want("main_key_metrics"):
                     key_metrics_df = build_key_metrics_df(
@@ -490,19 +485,25 @@ class _ExportWorker(QObject):
                         track_arrays, pair_arrays, frame_map,
                         summary, node_names, track_names,
                         self._fps, px_per_cm,
+                        zone_label=zone_label,
                     )
                     _p = Path(path)
                     km_path = str(_p.with_name(_p.stem + "_key_metrics" + _p.suffix))
                     self.status.emit("Writing key metrics file…")
-                    with pd.ExcelWriter(km_path, engine="openpyxl") as km_writer:
-                        key_metrics_df.to_excel(km_writer, sheet_name="Key Metrics", index=False)
-                        if tracks.shape[3] >= 2:
-                            prox_df = build_proximity_orientation_df(
-                                tracks, kin, frame_map, node_names, track_names,
-                                self._fps, px_per_cm,
-                            )
-                            prox_df.to_excel(km_writer, sheet_name="Proximity & Orientation",
-                                             index=False)
+                    try:
+                        with pd.ExcelWriter(km_path, engine="openpyxl") as km_writer:
+                            key_metrics_df.to_excel(km_writer, sheet_name="Key Metrics", index=False)
+                            if tracks.shape[3] >= 2:
+                                prox_df = build_proximity_orientation_df(
+                                    tracks, kin, frame_map, node_names, track_names,
+                                    self._fps, px_per_cm,
+                                )
+                                prox_df.to_excel(km_writer, sheet_name="Proximity & Orientation",
+                                                 index=False)
+                    except PermissionError:
+                        raise PermissionError(
+                            f"Cannot write '{Path(km_path).name}' — close it in Excel and try again."
+                        )
 
                 # ---- Binned export (*_binned.xlsx, same directory) ----
                 any_binned = any(self._want(k) for k, _ in ExportOptionsDialog._BINNED_SHEETS)
@@ -510,12 +511,17 @@ class _ExportWorker(QObject):
                     self.status.emit("Writing binned export…")
                     _p = Path(path)
                     binned_path = str(_p.with_name(_p.stem + "_binned" + _p.suffix))
-                    write_binned_xlsx(
-                        track_arrays, pair_arrays, single_beh, pair_beh,
-                        tracks, node_names, track_names, self._fps, frame_map,
-                        kin=kin, output_path=binned_path,
-                        include_sheets=self._opts,
-                    )
+                    try:
+                        write_binned_xlsx(
+                            track_arrays, pair_arrays, single_beh, pair_beh,
+                            tracks, node_names, track_names, self._fps, frame_map,
+                            kin=kin, output_path=binned_path,
+                            include_sheets=self._opts,
+                        )
+                    except PermissionError:
+                        raise PermissionError(
+                            f"Cannot write '{Path(binned_path).name}' — close it in Excel and try again."
+                        )
 
                 # ---- Graph export (PDF files, same directory) ----
                 any_graph = any(self._want(k) for k, _ in ExportOptionsDialog._GRAPH_PDFS)
@@ -581,6 +587,77 @@ class _ExportWorker(QObject):
             self.error.emit(traceback.format_exc())
 
 
+class ProcessingOptionsDialog(QDialog):
+    """Choose which analysis modules to run before processing."""
+
+    def __init__(self, n_tracks=1, default_opts=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Processing Options")
+        self.setWindowIcon(_make_icon("export"))
+        self.setMinimumWidth(340)
+
+        po = default_opts or {}
+        layout = QVBoxLayout(self)
+        self._checks: dict[str, QCheckBox] = {}
+
+        # Always-on group
+        grp_core = QGroupBox("Core (always computed)")
+        vb = QVBoxLayout(grp_core)
+        cb_kin = QCheckBox("Kinematics  (speed / accel / jerk / heading)")
+        cb_kin.setChecked(True); cb_kin.setEnabled(False)
+        vb.addWidget(cb_kin)
+        layout.addWidget(grp_core)
+
+        # Single-animal group
+        grp_single = QGroupBox("Single-Animal Analysis")
+        vb2 = QVBoxLayout(grp_single)
+        self._add_check(vb2, 'proc_single_beh',
+                        "Single-animal behaviors  (stationary, locomotion, turning)",
+                        po.get('proc_single_beh', True))
+        self._add_check(vb2, 'proc_features',
+                        "Feature arrays  (shape, path efficiency, entropy, curvature)",
+                        po.get('proc_features', True))
+        self._add_check(vb2, 'proc_zones',
+                        "Zone analysis  (center / perimeter / corner)",
+                        po.get('proc_zones', True))
+        layout.addWidget(grp_single)
+
+        # Pair group (disabled if single track)
+        grp_pair = QGroupBox("Pair / Social Analysis")
+        vb3 = QVBoxLayout(grp_pair)
+        self._add_check(vb3, 'proc_pair_beh',
+                        "Pair behaviors  (proximity subtypes, approach, following)",
+                        po.get('proc_pair_beh', True))
+        self._add_check(vb3, 'proc_proximity',
+                        "Proximity tracking  (inter-animal distance, bouts)",
+                        po.get('proc_proximity', True))
+        if n_tracks < 2:
+            grp_pair.setEnabled(False)
+            grp_pair.setToolTip("Requires \u2265 2 tracked animals")
+        layout.addWidget(grp_pair)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Analyze")
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _add_check(self, layout, key, label, checked):
+        cb = QCheckBox(label); cb.setChecked(checked)
+        self._checks[key] = cb; layout.addWidget(cb)
+
+    def _accept(self):
+        if not any(cb.isChecked() for cb in self._checks.values()):
+            QMessageBox.warning(self, "Nothing selected",
+                                "Select at least one analysis module.")
+            return
+        self.accept()
+
+    def options(self) -> dict:
+        return {'proc_kinematics': True,
+                **{k: cb.isChecked() for k, cb in self._checks.items()}}
+
+
 class ExportOptionsDialog(QDialog):
     """Modal dialog letting the user pick which export outputs to generate."""
 
@@ -634,7 +711,8 @@ class ExportOptionsDialog(QDialog):
         "rf_analysis_plots": ["_rf_analysis.pdf"],
     }
 
-    def __init__(self, graphs_available=True, default_dir="", default_name="export", parent=None):
+    def __init__(self, graphs_available=True, default_dir="", default_name="export",
+                 proc_opts=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Options")
         self.setWindowIcon(_make_icon("export"))
@@ -671,6 +749,34 @@ class ExportOptionsDialog(QDialog):
         if not _RF_AVAILABLE:
             rf_grp.setEnabled(False)
             rf_grp.setToolTip("scikit-learn not available — RF analysis disabled")
+
+        # ---- Gate checkboxes based on what was processed ----
+        _PROC_GATES = {
+            "main_1st_order_behaviors":  "proc_single_beh",
+            "main_2nd_order_behaviors":  "proc_pair_beh",
+            "main_behavior_summary":     "proc_single_beh",
+            "main_engagement_indices":   "proc_pair_beh",
+            "main_animal_features":      "proc_features",
+            "main_pair_features":        "proc_features",
+            "main_zone_summary":         "proc_zones",
+            "binned_animal_025":         "proc_features",
+            "binned_pair_025":           "proc_features",
+            "binned_eng_indices_025":    "proc_pair_beh",
+            "binned_animal_1s":          "proc_features",
+            "binned_pair_1s":            "proc_features",
+            "graph_heatmaps":            "proc_zones",
+            "graph_distance":            "proc_proximity",
+            "graph_oncoplot":            "proc_features",
+            "graph_sync_oncoplot":       "proc_pair_beh",
+            "graph_oncoplot_clean":      "proc_features",
+            "graph_sync_oncoplot_clean": "proc_pair_beh",
+            "graph_dist_features":       "proc_features",
+        }
+        if proc_opts:
+            for key, proc_key in _PROC_GATES.items():
+                if key in self._checks and not proc_opts.get(proc_key, True):
+                    self._checks[key].setChecked(False)
+                    self._checks[key].setEnabled(False)
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -920,6 +1026,223 @@ def _feat_unit(name, ipc):
     return 1.0, ''
 
 
+class _MetricsPanel(QWidget):
+    """Live metrics panel shown below the post-processed video."""
+
+    _STYLE = (
+        "QWidget#MetricsPanel { background:#1a2428; }"
+        "QLabel { color:#c0d8e0; font:11px 'Consolas','Courier New',monospace; }"
+        "QLabel[role='hdr']     { color:#4a9ab0; font-weight:700; margin-top:3px; }"
+        "QLabel[role='apart']   { color:#888888; }"
+        "QLabel[role='prox']    { color:#f0c040; font-weight:700; }"
+        "QLabel[role='contact'] { color:#ff6060; font-weight:700; }"
+        "QLabel[role='bout']    { color:#50e090; font-weight:700; }"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("MetricsPanel")
+        self.setStyleSheet(self._STYLE)
+        self.setFixedHeight(110)
+        self._build()
+
+    # ---- construction --------------------------------------------------
+
+    def _lbl(self, text='—', role=None):
+        l = QLabel(text)
+        if role:
+            l.setProperty('role', role)
+        return l
+
+    def _build(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(8, 4, 8, 4)
+        root.setSpacing(14)
+
+        # POSITION
+        col0 = QVBoxLayout(); col0.setSpacing(1)
+        col0.addWidget(self._lbl('POSITION', 'hdr'))
+        self._lbl_time  = self._lbl(); col0.addWidget(self._lbl_time)
+        self._lbl_frame = self._lbl(); col0.addWidget(self._lbl_frame)
+        self._lbl_pct   = self._lbl(); col0.addWidget(self._lbl_pct)
+        col0.addStretch()
+
+        # PER MOUSE (two sub-columns)
+        col1 = QVBoxLayout(); col1.setSpacing(1)
+        col1.addWidget(self._lbl('PER MOUSE', 'hdr'))
+        pm_row = QHBoxLayout(); pm_row.setSpacing(10)
+        self._track_cols = []
+        for _ in range(2):
+            tc = QVBoxLayout(); tc.setSpacing(1)
+            d = {'name': self._lbl(), 'spd': self._lbl(),
+                 'state': self._lbl(), 'zone': self._lbl(), 'dist': self._lbl()}
+            for l in d.values():
+                tc.addWidget(l)
+            self._track_cols.append(d)
+            pm_row.addLayout(tc)
+        col1.addLayout(pm_row)
+        col1.addStretch()
+
+        # INTERACTION
+        col2 = QVBoxLayout(); col2.setSpacing(1)
+        col2.addWidget(self._lbl('INTERACTION', 'hdr'))
+        self._lbl_idist = self._lbl(); col2.addWidget(self._lbl_idist)
+        self._lbl_chip  = self._lbl('Apart', 'apart'); col2.addWidget(self._lbl_chip)
+        self._lbl_hdg   = self._lbl(); col2.addWidget(self._lbl_hdg)
+        col2.addStretch()
+
+        # BOUT STATUS
+        col3 = QVBoxLayout(); col3.setSpacing(1)
+        col3.addWidget(self._lbl('BOUT STATUS', 'hdr'))
+        self._lbl_btype = self._lbl(); col3.addWidget(self._lbl_btype)
+        self._lbl_belap = self._lbl(); col3.addWidget(self._lbl_belap)
+        col3.addStretch()
+
+        # RUNNING TALLY
+        col4 = QVBoxLayout(); col4.setSpacing(1)
+        col4.addWidget(self._lbl('RUNNING TALLY', 'hdr'))
+        self._lbl_ptally = self._lbl(); col4.addWidget(self._lbl_ptally)
+        self._lbl_ctally = self._lbl(); col4.addWidget(self._lbl_ctally)
+        col4.addStretch()
+
+        for col in (col0, col1, col2, col3, col4):
+            root.addLayout(col)
+
+    # ---- public API ----------------------------------------------------
+
+    def clear(self):
+        for l in (self._lbl_time, self._lbl_frame, self._lbl_pct,
+                  self._lbl_idist, self._lbl_hdg,
+                  self._lbl_btype, self._lbl_belap,
+                  self._lbl_ptally, self._lbl_ctally):
+            l.setText('—')
+        self._set_chip('—', 'apart')
+        for tc in self._track_cols:
+            for l in tc.values():
+                l.setText('—')
+
+    def refresh(self, sleap_idx, video_frame_idx, n_frames, fps,
+                analysis_start_vidframe, cache):
+        if cache is None:
+            self.clear()
+            return
+
+        inv_ppcm    = cache['inv_ppcm']
+        kin         = cache['kin']
+        single_beh  = cache['single_beh']
+        track_names = cache['track_names']
+        n_tracks    = cache.get('n_tracks', len(track_names))
+        si_to_pos   = cache.get('si_to_pos', {})
+        tracked_idx = si_to_pos.get(sleap_idx)   # position in frame-map-filtered arrays
+
+        # ---- POSITION ----
+        elapsed = max(0, video_frame_idx - analysis_start_vidframe) / fps
+        total_s = (n_frames - 1) / fps
+        self._lbl_time.setText(f"Time:  {elapsed:.2f}s / {total_s:.1f}s")
+        self._lbl_frame.setText(f"Frame: {video_frame_idx} / {n_frames - 1}")
+        self._lbl_pct.setText(f"Pos:   {100 * video_frame_idx / max(n_frames - 1, 1):.1f}%")
+
+        # ---- PER MOUSE ----
+        speed_rolling = cache.get('speed_rolling', {})
+        zone_label    = cache.get('zone_label', {})
+        for t, tc in enumerate(self._track_cols):
+            if t >= n_tracks:
+                for l in tc.values():
+                    l.setText('—')
+                continue
+            tname = track_names[t] if t < len(track_names) else f't{t}'
+            tc['name'].setText(f'[{tname}]')
+
+            sr = speed_rolling.get(t)
+            if sr is not None and sleap_idx < len(sr):
+                tc['spd'].setText(f'Spd: {float(sr[sleap_idx]) * inv_ppcm:.1f} cm/s')
+            else:
+                tc['spd'].setText('Spd: —')
+
+            state = 'Unknown'
+            for sk in ('running', 'turning', 'walking', 'stationary'):
+                arr = single_beh.get(sk)
+                if arr is not None and sleap_idx < len(arr) and int(arr[sleap_idx, t]):
+                    state = ('Immobile' if sk == 'stationary' else 'Moving')
+                    break
+            tc['state'].setText(f'State: {state}')
+
+            zl = zone_label.get(t)
+            zone = str(zl[sleap_idx]) if zl is not None and sleap_idx < len(zl) else '—'
+            tc['zone'].setText(f'Zone: {zone}')
+
+            fa = cache.get('track_feat', {}).get(t, {})
+            dt = fa.get('cm_total_disp')
+            if dt is not None and sleap_idx < len(dt):
+                tc['dist'].setText(f'Dist: {float(dt[sleap_idx]) * inv_ppcm:.1f} cm')
+            else:
+                tc['dist'].setText('Dist: —')
+
+        # ---- INTERACTION ----
+        gen_dist = cache.get('gen_dist_tracked')
+        gen_close = cache.get('gen_closest_tracked')
+        if gen_dist is not None and tracked_idx is not None and tracked_idx < len(gen_dist):
+            d_px = float(gen_dist[tracked_idx])
+            d_cm = d_px * inv_ppcm
+            pair_lbl = str(gen_close[tracked_idx]) if gen_close is not None else ''
+            self._lbl_idist.setText(f'Dist: {d_cm:.2f} cm  [{pair_lbl}]')
+            prox_px = cache.get('prox_px', 0)
+            cont_px = cache.get('cont_px', 0)
+            if d_px <= cont_px:
+                self._set_chip('Contact  (<=1cm)', 'contact')
+            elif d_px <= prox_px:
+                self._set_chip('Proximity (<=3cm)', 'prox')
+            else:
+                self._set_chip('Apart', 'apart')
+        else:
+            self._lbl_idist.setText('Dist: —')
+            self._set_chip('—', 'apart')
+
+        hdg_diff = cache.get('hdg_diff')
+        if hdg_diff is not None and sleap_idx < len(hdg_diff):
+            self._lbl_hdg.setText(f'Heading \u0394: {float(hdg_diff[sleap_idx]):.0f}\u00b0')
+        else:
+            self._lbl_hdg.setText('Heading \u0394: —')
+
+        # ---- BOUT STATUS ----
+        prox_bouts = cache.get('prox_bouts', [])
+        cont_bouts = cache.get('cont_bouts', [])
+        bout_type = None; bout_start = None
+        if tracked_idx is not None:
+            for s, e in cont_bouts:
+                if s <= tracked_idx <= e:
+                    bout_type = 'Contact'; bout_start = s; break
+            if bout_type is None:
+                for s, e in prox_bouts:
+                    if s <= tracked_idx <= e:
+                        bout_type = 'Proximity'; bout_start = s; break
+        if bout_type is not None:
+            elapsed_b = (tracked_idx - bout_start) / fps
+            self._lbl_btype.setText(f'{bout_type} (General)')
+            self._lbl_belap.setText(f'Elapsed: {elapsed_b:.1f}s')
+        else:
+            self._lbl_btype.setText('none')
+            self._lbl_belap.setText('')
+
+        # ---- RUNNING TALLY ----
+        prox_ct = cache.get('prox_cumtime')
+        cont_ct = cache.get('cont_cumtime')
+        pt = float(prox_ct[tracked_idx]) if (prox_ct is not None and tracked_idx is not None
+                                             and tracked_idx < len(prox_ct)) else 0.0
+        ct = float(cont_ct[tracked_idx]) if (cont_ct is not None and tracked_idx is not None
+                                             and tracked_idx < len(cont_ct)) else 0.0
+        self._lbl_ptally.setText(f'Prox so far:    {pt:.1f}s')
+        self._lbl_ctally.setText(f'Contact so far: {ct:.1f}s')
+
+    # ---- helpers -------------------------------------------------------
+
+    def _set_chip(self, text, role):
+        self._lbl_chip.setText(text)
+        self._lbl_chip.setProperty('role', role)
+        self._lbl_chip.style().unpolish(self._lbl_chip)
+        self._lbl_chip.style().polish(self._lbl_chip)
+
+
 class _DataPopup(QWidget):
     """Floating window showing all computed data for the current frame."""
 
@@ -1024,6 +1347,8 @@ class _DataPopup(QWidget):
 
             self._add_section(f"{tname}  —  Behaviors")
             for bk in single_keys:
+                if bk not in single_beh:
+                    continue
                 arr = single_beh[bk]
                 self._add_row(bk, lambda si, _a=arr, _t=t: str(int(_a[si, _t])))
 
@@ -1243,10 +1568,12 @@ class RunPopUp(QWidget):
         lbl_post.setAlignment(Qt.AlignCenter)
         self.view_b = ROIView()
         self.view_b.setMinimumSize(360, 200)
+        self._metrics_panel = _MetricsPanel(self)
         right_col = QVBoxLayout()
         right_col.setSpacing(3)
         right_col.addWidget(lbl_post)
         right_col.addWidget(self.view_b, stretch=1)
+        right_col.addWidget(self._metrics_panel, stretch=0)
 
         video_row.addLayout(left_col, stretch=1)
         video_row.addLayout(right_col, stretch=1)
@@ -1347,8 +1674,7 @@ class RunPopUp(QWidget):
         )
         main.addWidget(self._progress_bar)
 
-        # Spacer where ROI pixel info used to be
-        main.addSpacing(30)
+        # (spacer removed — _MetricsPanel now occupies this area)
 
         # Signal connections
         self._slider.sliderPressed.connect(self._on_slider_pressed)
@@ -1413,6 +1739,11 @@ class RunPopUp(QWidget):
                 if (self._data_popup is not None
                         and self._data_popup.isVisible()):
                     self._data_popup.refresh(sleap_idx, index)
+                self._metrics_panel.refresh(
+                    sleap_idx, index, self._n_frames, self._fps,
+                    self._analysis_start_vidframe, self._analysis_cache)
+            else:
+                self._metrics_panel.clear()
 
             self.view.set_frame(frame_orig)
             self.view_b.set_frame(frame_post)
@@ -1422,7 +1753,7 @@ class RunPopUp(QWidget):
 
             self._frame_label.setText(f"{self._index:04d} / {self._n_frames - 1:04d}")
 
-            # Time display: counts from 0 starting at analysis start (15s trim)
+            # Time display: counts from 0 starting at analysis start (5s trim)
             elapsed = max(0, index - self._analysis_start_vidframe) / self._fps
             self._time_label.setText(f"{elapsed:.1f}s")
 
@@ -1545,6 +1876,8 @@ class RunPopUp(QWidget):
 
     def _on_arena_cm_changed(self, _):
         self._recompute_zones()
+        if self._analysis_cache is not None:
+            self._precompute_analysis(proc_opts=getattr(self, '_proc_opts', None))
         self._show_frame(self._index)
 
     # ---- Process -------------------------------------------------------
@@ -1558,6 +1891,17 @@ class RunPopUp(QWidget):
                 return
         except RuntimeError:
             pass
+
+        # Show processing options dialog before starting
+        n_tracks = self._sleap_data["tracks"].shape[3]
+        proc_dlg = ProcessingOptionsDialog(
+            n_tracks=n_tracks,
+            default_opts=getattr(self, '_proc_opts', None),
+            parent=self,
+        )
+        if proc_dlg.exec() != QDialog.Accepted:
+            return
+        self._proc_opts = proc_dlg.options()
 
         self._btn_process.setEnabled(False)
         self._btn_process.setText("Processing…")
@@ -1588,7 +1932,7 @@ class RunPopUp(QWidget):
         self._btn_process.setEnabled(True)
         self._btn_process.setText("Process")
         self._progress_bar.setVisible(False)
-        self._precompute_analysis()
+        self._precompute_analysis(proc_opts=getattr(self, '_proc_opts', None))
         self._show_frame(self._index)
 
     def _on_process_error(self, msg):
@@ -1599,7 +1943,7 @@ class RunPopUp(QWidget):
 
     # ---- Analysis precompute & overlay ---------------------------------
 
-    def _precompute_analysis(self):
+    def _precompute_analysis(self, proc_opts=None):
         """Cache kinematics, behaviors and features for overlay/popup use."""
         if self._analysis_cache is not None:
             self._analysis_cache.clear()
@@ -1622,24 +1966,43 @@ class RunPopUp(QWidget):
         (rx0, ry0), (rx1, ry1), side = roi
         px_per_cm = side / max(self._spin_arena_cm.value(), 1)
 
-        # ---- Trim first 15 seconds (hand placement buffer) ----
+        # Resolve processing options
+        po          = proc_opts or {}
+        do_single   = po.get('proc_single_beh', True)
+        do_pair     = po.get('proc_pair_beh', True)
+        do_features = po.get('proc_features', True)
+        do_zones    = po.get('proc_zones', True)
+        do_prox     = po.get('proc_proximity', True)
+
+        # ---- Trim first 5 seconds (hand placement buffer) ----
         n_frames = tracks.shape[0]
-        analysis_start = min(int(15 * self._fps), n_frames)
+        analysis_start = min(int(5 * self._fps), n_frames)
         # Find the first video frame at or after the analysis start
         valid_vframes = [vf for vf, si in frame_map.items() if si >= analysis_start]
         self._analysis_start_vidframe = min(valid_vframes) if valid_vframes else 0
         tracks = tracks[analysis_start:]
+        n_frames = tracks.shape[0]
         frame_map = {vf: si - analysis_start
                      for vf, si in frame_map.items()
                      if si >= analysis_start}
 
-        kin         = compute_kinematics(tracks, self._fps, node_names=node_names)
-        single_beh  = compute_single_animal(tracks, kin, node_names, self._fps,
-                                               px_per_cm=px_per_cm)
-        pair_beh    = compute_pairwise(tracks, node_names, self._fps, dsr=None, kin=kin)
-        track_feat, pair_feat = precompute_feature_arrays(
-            tracks, kin, node_names, self._fps,
-            roi=(rx0, ry0, rx1, ry1))
+        n_tracks = tracks.shape[3]
+
+        kin = compute_kinematics(tracks, self._fps, node_names=node_names)
+
+        single_beh = (compute_single_animal(tracks, kin, node_names, self._fps,
+                                            px_per_cm=px_per_cm)
+                      if do_single else {})
+
+        pair_beh = (compute_pairwise(tracks, node_names, self._fps, dsr=None, kin=kin)
+                    if (do_pair and n_tracks >= 2) else {})
+
+        if do_features:
+            track_feat, pair_feat = precompute_feature_arrays(
+                tracks, kin, node_names, self._fps,
+                roi=(rx0, ry0, rx1, ry1))
+        else:
+            track_feat, pair_feat = {}, {}
 
         # Resolve body-center node index
         body_idx = find_node_idx(node_names, 'body')
@@ -1652,7 +2015,65 @@ class RunPopUp(QWidget):
             frame_map=frame_map, body_idx=body_idx,
             inv_ppcm=1.0 / max(px_per_cm, 1e-9),
             px_per_cm=px_per_cm,
+            proc_opts=po,
         )
+
+        # ---- Metrics panel precomputes (indexed by tracked position) ----
+        sleap_idxs_arr = np.array(sorted(frame_map.values()))
+        si_to_pos = {int(si): pos for pos, si in enumerate(sleap_idxs_arr)}
+
+        ROLL_W = max(3, round(0.2 * self._fps))
+        speed_rolling = {}
+        for t in range(n_tracks):
+            spd = (kin['speed'][:, body_idx, t] if body_idx is not None
+                   else np.nanmean(kin['speed'][:, :, t], axis=1))
+            speed_rolling[t] = (pd.Series(spd)
+                                  .rolling(ROLL_W, center=True, min_periods=1)
+                                  .mean().to_numpy())
+
+        if do_zones:
+            strip_px = self._spin_strip_cm.value() * px_per_cm
+            zone_label = {}
+            for t in range(n_tracks):
+                ni = body_idx if body_idx is not None else 0
+                x = tracks[:, 0, ni, t]
+                y = tracks[:, 1, ni, t]
+                near_h = np.minimum(x - rx0, rx1 - x) < strip_px
+                near_v = np.minimum(y - ry0, ry1 - y) < strip_px
+                lbl = np.full(n_frames, 'Center', dtype=object)
+                lbl[near_h ^ near_v] = 'Perimeter'
+                lbl[near_h & near_v] = 'Corner'
+                zone_label[t] = lbl
+        else:
+            zone_label = {}
+
+        prox_px = PROX_THRESHOLD_CM * px_per_cm
+        cont_px = CONTACT_THRESHOLD_CM * px_per_cm
+        if do_prox and n_tracks >= 2 and len(sleap_idxs_arr) > 0:
+            tailend_excl = _tailend_node_idxs(node_names)
+            gen_dist_tracked, gen_closest_tracked = _general_min_dist(
+                tracks, sleap_idxs_arr, 0, 1, node_names, exclude_idxs=tailend_excl)
+            prox_bouts   = _detect_bouts(gen_dist_tracked <= prox_px, self._fps)
+            cont_bouts   = _detect_bouts(gen_dist_tracked <= cont_px, self._fps)
+            prox_cumtime = np.cumsum((gen_dist_tracked <= prox_px).astype(float)) / self._fps
+            cont_cumtime = np.cumsum((gen_dist_tracked <= cont_px).astype(float)) / self._fps
+            hdg_diff = np.abs(kin['body_heading_deg'][:, 0]
+                              - kin['body_heading_deg'][:, 1]) % 360
+            hdg_diff = np.minimum(hdg_diff, 360 - hdg_diff)
+        else:
+            gen_dist_tracked = gen_closest_tracked = None
+            prox_bouts = cont_bouts = []
+            prox_cumtime = cont_cumtime = hdg_diff = None
+
+        self._analysis_cache.update(dict(
+            n_tracks=n_tracks, si_to_pos=si_to_pos,
+            speed_rolling=speed_rolling, zone_label=zone_label,
+            gen_dist_tracked=gen_dist_tracked, gen_closest_tracked=gen_closest_tracked,
+            prox_bouts=prox_bouts, cont_bouts=cont_bouts,
+            prox_cumtime=prox_cumtime, cont_cumtime=cont_cumtime,
+            hdg_diff=hdg_diff, prox_px=prox_px, cont_px=cont_px,
+        ))
+        self._metrics_panel.clear()
 
         # Build / rebuild the data popup
         if self._data_popup is None:
@@ -1666,95 +2087,7 @@ class RunPopUp(QWidget):
         self._btn_inspect.setEnabled(True)
 
     def _draw_analysis_overlay(self, frame, sleap_idx):
-        """Draw per-track state / speed / heading + pair flags on frame_post."""
-        c = self._analysis_cache
-        if c is None:
-            return frame
-
-        tracks     = c['tracks']
-        kin        = c['kin']
-        sb         = c['single_beh']
-        pb         = c['pair_beh']
-        track_names= c['track_names']
-        node_names = c['node_names']
-        body_idx   = c['body_idx']
-        inv_ppcm   = c['inv_ppcm']
-        n_tracks   = tracks.shape[3]
-
-        FONT  = cv2.FONT_HERSHEY_SIMPLEX
-        FS    = 0.46
-        THICK = 1
-        # State colors in BGR
-        SC = {
-            'running':    (0,   80, 255),
-            'turning':    (0,  200, 255),
-            'walking':    (60, 200,  60),
-            'stationary': (160, 160, 160),
-        }
-
-        lines = []   # list of (text, BGR)
-        for t in range(n_tracks):
-            tname = track_names[t]
-            state = 'UNKNOWN'; sc = (200, 200, 200)
-            for sk in ('running', 'turning', 'walking', 'stationary'):
-                arr = sb.get(sk)
-                if arr is not None and int(arr[sleap_idx, t]):
-                    state = sk.upper(); sc = SC[sk]; break
-            n = body_idx if body_idx is not None else 0
-            spd = float(kin['speed'][sleap_idx, n, t]) * inv_ppcm
-            hdg = float(kin['body_heading_deg'][sleap_idx, t])
-            lines.append((f"[{tname}] {state}", sc))
-            lines.append((f"  Spd:{spd:.1f}cm/s  Hdg:{hdg:.0f}deg", (200, 200, 200)))
-
-        # Pair summary
-        seen = set()
-        for key in pb:
-            if '/' not in key:
-                continue
-            pfx = key.rsplit('/', 1)[0]
-            if pfx in seen:
-                continue
-            seen.add(pfx)
-            try:
-                parts = pfx.split('_')
-                tA = int(parts[0][1:]); tB = int(parts[1][1:])
-                nA = track_names[tA] if tA < len(track_names) else f't{tA}'
-                nB = track_names[tB] if tB < len(track_names) else f't{tB}'
-            except (ValueError, IndexError):
-                continue
-            n = body_idx if body_idx is not None else 0
-            xA = float(tracks[sleap_idx, 0, n, tA]); yA = float(tracks[sleap_idx, 1, n, tA])
-            xB = float(tracks[sleap_idx, 0, n, tB]); yB = float(tracks[sleap_idx, 1, n, tB])
-            if np.isnan(xA) or np.isnan(xB):
-                dist_str = "?"
-            else:
-                dist_str = f"{np.hypot(xA - xB, yA - yB) * inv_ppcm:.1f}cm"
-            lines.append((f"[{nA} vs {nB}] dist:{dist_str}", (80, 160, 255)))
-            flags = []
-            for flag in ('NoseNose', 'Contact', 'Engaged'):
-                arr = pb.get(f'{pfx}/{flag}')
-                if arr is not None:
-                    try:
-                        v = arr[sleap_idx]
-                        if bool(v) and not (isinstance(v, float) and np.isnan(v)):
-                            flags.append(flag)
-                    except Exception:
-                        pass
-            if flags:
-                lines.append((f"  {' | '.join(flags)}", (0, 220, 120)))
-
-        # Draw semi-transparent box + text
-        line_h = 20; pad = 6
-        box_h  = len(lines) * line_h + pad * 2
-        box_w  = min(frame.shape[1] - 16,
-                     max(240, max(len(t) * 7 for t, _ in lines) + pad * 2))
-        ox, oy = 8, 8
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (ox, oy), (ox + box_w, oy + box_h), (10, 10, 10), -1)
-        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        for i, (text, color) in enumerate(lines):
-            y = oy + pad + (i + 1) * line_h - 4
-            cv2.putText(frame, text, (ox + 5, y), FONT, FS, color, THICK, cv2.LINE_AA)
+        """Info now shown in _MetricsPanel; this overlay is retired."""
         return frame
 
     def _on_inspect_toggled(self, checked):
@@ -1793,6 +2126,7 @@ class RunPopUp(QWidget):
         vp = Path(self._video_path)
         dlg = ExportOptionsDialog(
             graphs_available=_GRAPHS_AVAILABLE,
+            proc_opts=self._analysis_cache.get('proc_opts') if self._analysis_cache else None,
             default_dir=str(vp.parent),
             default_name=vp.stem,
             parent=self,
@@ -1828,7 +2162,7 @@ class RunPopUp(QWidget):
             pass
 
         self._export_worker = _ExportWorker(
-            processed_data=self._processed_sleap_data,
+            analysis_cache=self._analysis_cache,
             fps=self._fps,
             roi=roi,
             arena_cm=self._spin_arena_cm.value(),

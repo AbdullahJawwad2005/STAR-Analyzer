@@ -1,4 +1,7 @@
 import gc
+import logging
+import sys
+import traceback
 import cv2
 
 from PySide6.QtCore import Qt, QDateTime, QPointF, QRectF
@@ -67,6 +70,50 @@ def _make_star_icon(size: int = 32) -> QIcon:
     return icon
 
 
+class _QtLogHandler(logging.Handler):
+    """Forwards Python logging records to MainWindow.log()."""
+
+    def __init__(self, window):
+        super().__init__()
+        self._window = window
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            level_map = {
+                logging.DEBUG:    'info',
+                logging.INFO:     'info',
+                logging.WARNING:  'warn',
+                logging.ERROR:    'error',
+                logging.CRITICAL: 'error',
+            }
+            level = level_map.get(record.levelno, 'info')
+            self._window.log(msg, level)
+        except Exception:
+            pass
+
+
+class _StderrRedirect:
+    """Writes anything sent to stderr into MainWindow.log() as an error."""
+
+    def __init__(self, window, original):
+        self._window = window
+        self._original = original
+        self._buf = []
+
+    def write(self, text: str) -> None:
+        self._original.write(text)          # keep terminal copy
+        stripped = text.rstrip('\n')
+        if stripped:
+            self._window.log(stripped, 'error')
+
+    def flush(self) -> None:
+        self._original.flush()
+
+    def fileno(self):                       # needed by some libraries
+        return self._original.fileno()
+
+
 class MainWindow(QMainWindow):
     """Main application window for loading STAR video/tracking data."""
 
@@ -93,6 +140,26 @@ class MainWindow(QMainWindow):
         frame = self.frameGeometry()
         frame.moveCenter(geo.center())
         self.move(frame.topLeft())
+
+    def setup_debug_routing(self) -> None:
+        """Route Python logging + stderr + unhandled exceptions into the debug panel."""
+        # Logging handler
+        handler = _QtLogHandler(self)
+        handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        logging.getLogger().addHandler(handler)
+
+        # stderr redirect
+        sys.stderr = _StderrRedirect(self, sys.stderr)
+
+        # Unhandled exception hook
+        def _excepthook(exc_type, exc_value, exc_tb):
+            lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+            full = "".join(lines).strip()
+            self.log(full, 'error')
+            # also keep default behaviour (prints to terminal)
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = _excepthook
 
     def _build_ui(self):
         self.setStyleSheet("""

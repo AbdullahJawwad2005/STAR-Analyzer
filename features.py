@@ -26,6 +26,9 @@ except ImportError:
 
 from behaviors import find_node_idx, angular_velocity
 
+PROX_THRESHOLD_CM    = 3.0   # general proximity threshold (cm)
+CONTACT_THRESHOLD_CM = 1.0   # general contact threshold (cm)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -350,6 +353,56 @@ def _position_entropy(cm_x, cm_y, roi, n_bins=10):
 
 
 # ---------------------------------------------------------------------------
+# General minimum cross-animal distance
+# ---------------------------------------------------------------------------
+
+def _general_min_dist(tracks, idxs, tA, tB, node_names, exclude_idxs=None):
+    """
+    Per-frame minimum distance across ALL cross-animal node pairs.
+
+    Parameters
+    ----------
+    exclude_idxs : set of int or None
+        Node indices to exclude from both animals (e.g. tailend).
+
+    Returns
+    -------
+    min_dist    : (len(idxs),) float — pixels; NaN where all nodes missing
+    closest_pair: (len(idxs),) object — 'nodeA-nodeB' label of minimising pair
+    """
+    n_nodes = tracks.shape[2]
+    active = [i for i in range(n_nodes) if exclude_idxs is None or i not in exclude_idxs]
+
+    xA = tracks[idxs][:, 0, :, tA][:, active]          # (n_idxs, n_active)
+    yA = tracks[idxs][:, 1, :, tA][:, active]
+    xB = tracks[idxs][:, 0, :, tB][:, active]
+    yB = tracks[idxs][:, 1, :, tB][:, active]
+
+    n_active = len(active)
+    dx = xA[:, :, np.newaxis] - xB[:, np.newaxis, :]  # (n_idxs, n_active, n_active)
+    dy = yA[:, :, np.newaxis] - yB[:, np.newaxis, :]
+    dists = np.hypot(dx, dy)
+    flat = dists.reshape(len(idxs), -1)                # (n_idxs, n_active*n_active)
+
+    with np.errstate(all='ignore'):
+        min_dist = np.nanmin(flat, axis=1)
+
+    has_data = np.any(np.isfinite(flat), axis=1)
+    flat_safe = np.where(np.isfinite(flat), flat, np.inf)
+    argmin_idx = np.argmin(flat_safe, axis=1)
+
+    i_idx = argmin_idx // n_active
+    j_idx = argmin_idx % n_active
+    names = np.array([node_names[k].replace(' ', '_') for k in active])
+    closest_pair = np.where(
+        has_data,
+        np.array([f'{names[i]}-{names[j]}' for i, j in zip(i_idx, j_idx)], dtype=object),
+        ''
+    )
+    return min_dist, closest_pair
+
+
+# ---------------------------------------------------------------------------
 # Pairwise features
 # ---------------------------------------------------------------------------
 
@@ -531,13 +584,186 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
 
 
 # ---------------------------------------------------------------------------
+# Bout detection helper
+# ---------------------------------------------------------------------------
+
+def _tailend_node_idxs(node_names):
+    """Return a set of node indices whose stripped name matches tailend aliases."""
+    _tailend_pats = {'tailend', 'tail_end', 'te'}
+    out = set()
+    for i, n in enumerate(node_names):
+        if n.lower().rstrip('0123456789') in _tailend_pats:
+            out.add(i)
+    return out
+
+
+def _detect_bouts(binary, fps):
+    """
+    Convert a boolean (or 0/1) array to a list of bout (start, end) index pairs.
+
+    Rules
+    -----
+    - A bout is a contiguous run of True values.
+    - Gaps of <= MAX_GAP_FRAMES consecutive False frames are bridged.
+    - After bridging, bouts shorter than MIN_BOUT_FRAMES are discarded.
+
+    Parameters
+    ----------
+    binary : (N,) bool array  — True = frame meets threshold
+    fps    : float
+
+    Returns
+    -------
+    bouts : list of (start, end) inclusive index pairs (in terms of binary's indices)
+    """
+    MAX_GAP_FRAMES = max(1, round(0.25 * fps))
+    MIN_BOUT_FRAMES = max(1, round(0.8 * fps))
+
+    arr = np.asarray(binary, dtype=bool)
+    n = len(arr)
+    if n == 0 or not np.any(arr):
+        return []
+
+    # Find run boundaries
+    padded = np.concatenate(([False], arr, [False]))
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.where(diff == 1)[0]   # rising edges
+    ends   = np.where(diff == -1)[0] - 1  # falling edges (inclusive)
+
+    # Bridge gaps
+    merged_starts = [starts[0]]
+    merged_ends   = [ends[0]]
+    for s, e in zip(starts[1:], ends[1:]):
+        gap = s - merged_ends[-1] - 1
+        if gap <= MAX_GAP_FRAMES:
+            merged_ends[-1] = e
+        else:
+            merged_starts.append(s)
+            merged_ends.append(e)
+
+    # Filter by minimum duration
+    bouts = [(s, e) for s, e in zip(merged_starts, merged_ends)
+             if (e - s + 1) >= MIN_BOUT_FRAMES]
+    return bouts
+
+
+def _bout_stats(dist_arr, thresh_px, fps):
+    """
+    Return (total_time_s, bout_count, mean_bout_s) for frames where dist <= thresh.
+    dist_arr may contain NaN; NaN frames count as above-threshold (not in bout).
+    """
+    binary = np.isfinite(dist_arr) & (dist_arr <= thresh_px)
+    bouts = _detect_bouts(binary, fps)
+    if not bouts:
+        return 0.0, 0, float('nan')
+    durations = [(e - s + 1) / fps for s, e in bouts]
+    return sum(durations), len(durations), float(np.mean(durations))
+
+
+# ---------------------------------------------------------------------------
+# Key Metrics bout filters (1-second minimum duration)
+# ---------------------------------------------------------------------------
+
+def _apply_state_hold_filter(labels, fps, min_dur_s=1.0):
+    """
+    State-hold filter for categorical zone labels.
+
+    Short runs (< min_dur_s) are replaced by the nearest preceding confirmed
+    state (one that lasted >= min_dur_s).  If no prior confirmed state exists,
+    the first subsequent confirmed state is used instead.  If no run ever
+    reaches min_dur_s, returns the original array unchanged.
+
+    Parameters
+    ----------
+    labels  : (N,) array-like of str  — e.g. 'Center', 'Perimeter', 'Corner'
+    fps     : float
+    min_dur_s : float  — minimum bout duration in seconds (default 1.0)
+
+    Returns
+    -------
+    filtered : (N,) np.ndarray of str (copy)
+    """
+    labels = np.asarray(labels, dtype=object)
+    n = len(labels)
+    if n == 0:
+        return labels.copy()
+
+    min_frames = round(fps * min_dur_s)
+
+    # Run-length encode
+    change_pts = np.where(np.concatenate(([True], labels[1:] != labels[:-1])))[0]
+    lengths    = np.diff(np.append(change_pts, n))
+    values     = labels[change_pts]
+
+    # Identify confirmed runs
+    confirmed = lengths >= min_frames
+    if not np.any(confirmed):
+        return labels.copy()  # fallback: no run qualifies — return unchanged
+
+    # Build output by assigning each run its confirmed replacement
+    out = labels.copy()
+    last_confirmed_val = None
+
+    for i, (start, length, val) in enumerate(zip(change_pts, lengths, values)):
+        if confirmed[i]:
+            last_confirmed_val = val
+            # (keep original — no change needed)
+        else:
+            if last_confirmed_val is not None:
+                # Replace with last confirmed state
+                out[start:start + length] = last_confirmed_val
+            else:
+                # No prior confirmed state — find first subsequent one
+                future = np.where(confirmed[i + 1:])[0]
+                if len(future):
+                    out[start:start + length] = values[i + 1 + future[0]]
+                # else: leave as-is (shouldn't happen since confirmed has ≥1 True)
+
+    return out
+
+
+def _filter_short_active_bouts(arr, fps, min_dur_s=1.0):
+    """
+    Zero out active (True/1) runs shorter than min_dur_s seconds.
+
+    Inactive (0) runs are never modified — no gap bridging.
+
+    Parameters
+    ----------
+    arr       : (N,) array-like — binary (bool or 0/1)
+    fps       : float
+    min_dur_s : float  — minimum active-bout duration in seconds (default 1.0)
+
+    Returns
+    -------
+    filtered : (N,) np.ndarray of float64 (copy)
+    """
+    arr = np.asarray(arr, dtype=np.float64)
+    if arr.size == 0 or not np.any(arr):
+        return arr.copy()
+
+    min_frames = round(fps * min_dur_s)
+
+    padded = np.concatenate(([0.0], arr, [0.0]))
+    diff   = np.diff(padded.astype(np.int8))
+    starts = np.where(diff == 1)[0]   # rising edges (indices into arr)
+    ends   = np.where(diff == -1)[0]  # exclusive end indices into arr
+
+    out = arr.copy()
+    for s, e in zip(starts, ends):
+        if (e - s) < min_frames:
+            out[s:e] = 0.0
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Key Metrics summary (one-glance overview sheet)
 # ---------------------------------------------------------------------------
 
 def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                          track_arrays, pair_arrays, frame_map,
                          zone_summary_df, node_names, track_names,
-                         fps, px_per_cm):
+                         fps, px_per_cm, zone_label=None):
     """
     Build a long-format DataFrame with essential behavioural summary metrics.
 
@@ -547,11 +773,13 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
     session_frames = len(frame_map)
     session_dur = session_frames / fps  # seconds
 
-    body_idx = find_node_idx(node_names, 'body')
-    nose_idx = find_node_idx(node_names, 'nose')
+    body_idx  = find_node_idx(node_names, 'body')
+    nose_idx  = find_node_idx(node_names, 'nose')
     ear_l_idx = find_node_idx(node_names, 'ear_l')
     ear_r_idx = find_node_idx(node_names, 'ear_r')
-    tail_idx = find_node_idx(node_names, 'tail')
+    hip_l_idx = find_node_idx(node_names, 'hip_l')
+    hip_r_idx = find_node_idx(node_names, 'hip_r')
+    tail_idx  = find_node_idx(node_names, 'tail')
 
     # Only use frames that are in the frame_map (valid sleap indices)
     sleap_idxs = np.array(sorted(frame_map.values()))
@@ -592,16 +820,26 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
         _add('Locomotion', 'Avg Acceleration', tname,
              float(np.nanmean(acc / px_per_cm)), 'cm/s²')
 
-        # Immobility
+        # Immobility (1-second minimum bout filter)
         if 'stationary' in single_beh:
-            stat_frames = float(np.nansum(single_beh['stationary'][sleap_idxs, t]))
+            stat_raw = single_beh['stationary'][sleap_idxs, t].astype(np.float64)
+            stat_filtered = _filter_short_active_bouts(stat_raw, fps)
+            stat_frames = float(np.nansum(stat_filtered))
             imm_time = stat_frames / fps
             _add('Immobility', 'Immobility Time', tname, imm_time, 's')
             _add('Immobility', 'Immobility %', tname,
                  imm_time / session_dur * 100 if session_dur > 0 else 0.0, '%')
 
-        # Zone times from zone_summary_df
-        if zone_summary_df is not None and not zone_summary_df.empty:
+        # Zone times (1-second minimum visit filter when zone_label available)
+        if zone_label is not None and t in zone_label and zone_label[t] is not None:
+            zl = _apply_state_hold_filter(zone_label[t][sleap_idxs], fps)
+            center_t = float(np.sum(zl == 'Center')) / fps
+            perim_t  = float(np.sum(zl == 'Perimeter')) / fps
+            corner_t = float(np.sum(zl == 'Corner')) / fps
+            _add('Zone', 'Center Zone Time', tname, center_t, 's')
+            _add('Zone', 'Perimeter Zone Time', tname, perim_t, 's')
+            _add('Zone', 'Corner Zone Time', tname, corner_t, 's')
+        elif zone_summary_df is not None and not zone_summary_df.empty:
             track_zones = zone_summary_df[zone_summary_df['Track'] == tname]
             # Center = Open zone
             open_row = track_zones[track_zones['Zone'] == 'Open']
@@ -622,10 +860,8 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
     if n_tracks < 2:
         return pd.DataFrame(rows, columns=['Category','Metric','Subject','Value','Unit'])
 
-    prox_thresh_cm = 3.0
-    contact_thresh_cm = 1.0
-    prox_thresh_px = prox_thresh_cm * px_per_cm
-    contact_thresh_px = contact_thresh_cm * px_per_cm
+    prox_thresh_px    = PROX_THRESHOLD_CM    * px_per_cm
+    contact_thresh_px = CONTACT_THRESHOLD_CM * px_per_cm
 
     for tA in range(n_tracks):
         for tB in range(tA + 1, n_tracks):
@@ -695,15 +931,32 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                 d2 = np.hypot(xa - xb, ya - yb)
                 dist_pairs['Nose-Tail'] = np.minimum(d1, d2)
 
-            # Proximity and contact times
+            # Proximity and contact times (1-second minimum bout filter)
             for label, dist_arr in dist_pairs.items():
-                valid = np.isfinite(dist_arr)
-                prox_frames = float(np.nansum(dist_arr[valid] <= prox_thresh_px))
-                contact_frames = float(np.nansum(dist_arr[valid] <= contact_thresh_px))
+                prox_bin = np.isfinite(dist_arr) & (dist_arr <= prox_thresh_px)
+                prox_bin = _filter_short_active_bouts(prox_bin, fps)
+                prox_frames = float(np.nansum(prox_bin))
+
+                cont_bin = np.isfinite(dist_arr) & (dist_arr <= contact_thresh_px)
+                cont_bin = _filter_short_active_bouts(cont_bin, fps)
+                contact_frames = float(np.nansum(cont_bin))
+
                 _add('Proximity', f'{label} Proximity Time', pair_name,
                      prox_frames / fps, 's')
                 _add('Contact', f'{label} Contact Time', pair_name,
                      contact_frames / fps, 's')
+
+            # General proximity/contact — minimum over all cross-animal node pairs
+            gen_dist, _ = _general_min_dist(tracks, sleap_idxs, tA, tB, node_names)
+            gen_prox_bin = np.isfinite(gen_dist) & (gen_dist <= prox_thresh_px)
+            gen_prox_bin = _filter_short_active_bouts(gen_prox_bin, fps)
+            _add('Proximity', 'General Proximity Time', pair_name,
+                 float(np.nansum(gen_prox_bin)) / fps, 's')
+
+            gen_cont_bin = np.isfinite(gen_dist) & (gen_dist <= contact_thresh_px)
+            gen_cont_bin = _filter_short_active_bouts(gen_cont_bin, fps)
+            _add('Contact', 'General Contact Time', pair_name,
+                 float(np.nansum(gen_cont_bin)) / fps, 's')
 
             # Mean angle when proximal (body-body ≤ 3cm)
             app_A_key = f'{pfx}/approach_angle_A'
@@ -759,16 +1012,11 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
     heading_B = kin['body_heading_deg'][:, tB]
     delta_heading = np.abs(((heading_A - heading_B) + 180.0) % 360.0 - 180.0)  # [0, 180]
 
-    # Centroid distance (pixels) for Within_3cm
-    if body_idx is not None:
-        cx_A = tracks[:, 0, body_idx, tA]; cy_A = tracks[:, 1, body_idx, tA]
-        cx_B = tracks[:, 0, body_idx, tB]; cy_B = tracks[:, 1, body_idx, tB]
-    else:
-        cx_A = np.nanmean(tracks[:, 0, :, tA], axis=1)
-        cy_A = np.nanmean(tracks[:, 1, :, tA], axis=1)
-        cx_B = np.nanmean(tracks[:, 0, :, tB], axis=1)
-        cy_B = np.nanmean(tracks[:, 1, :, tB], axis=1)
-    centroid_dist_px = np.hypot(cx_A - cx_B, cy_A - cy_B)
+    # General min cross-animal node-pair distance for Within_3cm / Within_1cm
+    all_idxs = np.arange(n_frames)
+    gen_min_px, gen_closest = _general_min_dist(tracks, all_idxs, tA, tB, node_names)
+    prox_px    = PROX_THRESHOLD_CM    * px_per_cm
+    contact_px = CONTACT_THRESHOLD_CM * px_per_cm
 
     # Group frame_map into 1-second bins keyed by integer second
     bins = {}
@@ -780,15 +1028,25 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
     for sec in sorted(bins):
         idxs = np.array(bins[sec])
 
-        # Within_3cm: binary — mean centroid distance that second < 3 cm
-        cd = centroid_dist_px[idxs]
-        mean_dist_cm = float(np.nanmean(cd)) / px_per_cm
-        within_3 = 1 if mean_dist_cm < 3.0 else 0
+        # Within_3cm / Within_1cm: any-frame general min-dist logic
+        gd = gen_min_px[idxs]
+        within_3 = int(np.any(gd <= prox_px))
+        within_1 = int(np.any(gd <= contact_px))
+
+        # Closest pair: mode among this second's frames
+        cp_sec = gen_closest[idxs]
+        finite_cp = cp_sec[np.isfinite(gd)]
+        if len(finite_cp):
+            vals, counts = np.unique(finite_cp, return_counts=True)
+            closest = str(vals[np.argmax(counts)])
+        else:
+            closest = ''
 
         # Heading angle
         ha = float(np.nanmean(delta_heading[idxs]))
 
-        row = {'Time(s)': sec, 'Within_3cm': within_3, 'Heading_Angle_deg': round(ha, 2)}
+        row = {'Time(s)': sec, 'Within_3cm': within_3, 'Within_1cm': within_1,
+               'closest_pair': closest, 'Heading_Angle_deg': round(ha, 2)}
 
         # Per-node distances
         for _cname, idx, col in canonical_nodes:
@@ -802,7 +1060,7 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
         rows.append(row)
 
     # Build ordered columns
-    col_order = ['Time(s)', 'Within_3cm', 'Heading_Angle_deg']
+    col_order = ['Time(s)', 'Within_3cm', 'Within_1cm', 'closest_pair', 'Heading_Angle_deg']
     for _cname, idx, col in canonical_nodes:
         if idx is not None:
             col_order.append(col)

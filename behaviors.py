@@ -465,7 +465,9 @@ def _path_efficiency(pos, half_win):
     si = np.maximum(np.arange(n) - half_win, 0)
     net = np.hypot(pos[ei, 0] - pos[si, 0], pos[ei, 1] - pos[si, 1])
 
-    eff = np.where(total > 1e-12, net / total, 0.0)
+    eff = np.zeros_like(net)
+    mask = total > 1e-12
+    eff[mask] = net[mask] / total[mask]
     return eff
 
 

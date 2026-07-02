@@ -1,8 +1,18 @@
 import sys
+import logging
 
 from PySide6.QtWidgets import QApplication
 
 from main_window import MainWindow, _make_star_icon
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("star_analyzer.log"),
+    ],
+)
 
 
 def main():
@@ -24,6 +34,7 @@ def main():
     window._center_on_screen()
     window.raise_()
     window.activateWindow()
+    window.setup_debug_routing()
     print("STAR Analyzer window opened (check taskbar / Alt+Tab).", flush=True)
     sys.exit(app.exec())
 

@@ -2,7 +2,7 @@
 
 # STAR Analyzer
 
-**Desktop analysis tool for SLEAP-based multi-animal behavioral tracking data.**  
+**Desktop analysis tool for SLEAP-based multi-animal behavioral tracking data.**
 Process pose-estimation exports, calibrate arenas, compute kinematics and social behavior metrics, and export analysis-ready Excel workbooks.
 
 <p>
@@ -44,13 +44,15 @@ ROI calibration and pixel-to-cm conversion
         ↓
 Gap filling and smoothing
         ↓
-Kinematics and body-feature extraction
+Processing Options dialog — choose which modules to run
         ↓
-1st-order behavior and pairwise social metrics
+Kinematics (always), behaviors, features, zones, proximity (selective)
         ↓
-Time-binned aggregation
+Analysis cache shared with Export — no double computation
         ↓
-Excel workbooks for analysis
+Export Options dialog — outputs gated by what was processed
+        ↓
+Excel workbooks + graph PDFs for analysis
 ```
 
 ---
@@ -70,6 +72,21 @@ Excel workbooks for analysis
 - Savitzky-Golay smoothing before kinematic computation
 - Frame mapping between video indices and SLEAP data indices
 
+### Selective Processing
+
+A **Processing Options** dialog before each run lets you choose which modules to compute:
+
+| Module | What it covers |
+|---|---|
+| Kinematics | Speed, acceleration, jerk, heading — always computed |
+| Single-animal behaviors | Stationary, locomotion, turning, directional reversal |
+| Feature arrays | Shape descriptors, path efficiency, entropy, curvature |
+| Zone analysis | Center / perimeter / corner classification |
+| Pair behaviors | Proximity subtypes, approach, following |
+| Proximity tracking | Inter-animal distance bouts and cumulative time |
+
+Unselected modules are skipped entirely — no wasted compute. The Export Options dialog automatically disables outputs that depend on skipped modules.
+
 ### Kinematics
 
 - Per-node velocity, speed, heading, acceleration, and jerk
@@ -80,26 +97,32 @@ Excel workbooks for analysis
 
 - Single-animal states: stationary, walking, running, turning, directional reversal
 - Pairwise interactions: NoseNose, NoseHead, NoseBody, NoseRear, Contact, CoOriented, AntiOriented, RelPos, Engaged, Disengaged
+- Second-order compound social behaviors computed at export time
 - Engagement Index, Reciprocity Index, and Retreat Index
 - Time-binned pair and animal features at 0.25 s and 1 s resolution
 
 ### Interface
 
-- Real-time overlay during playback
-- Data inspector popup for frame-by-frame review
+- Real-time overlay during playback with live metrics panel
+- Data inspector popup for frame-by-frame review of all computed values
 - Non-blocking processing and export through Qt worker threads
+- Analysis cache shared between Process and Export — kinematics and behaviors computed once
 
 ---
 
 ## Outputs
 
-Running an export produces three Excel workbooks:
+An export produces up to five output types depending on which options are selected:
 
 | File | Contents |
 |---|---|
-| `{name}.xlsx` | Tracking Data, Zone Summary, Session Info, 1st Order Behaviors, Behavior Summary, Engagement Indices, Animal Features, Pair Features |
+| `{name}.xlsx` | Tracking Data, Zone Summary, Session Info, 1st/2nd Order Behaviors, Behavior Summary, Engagement Indices, Animal Features, Pair Features |
 | `{name}_binned.xlsx` | Animal 0.25s, Pair 0.25s, Engagement Indices 0.25s, Animal 1s, Pair 1s |
 | `{name}_key_metrics.xlsx` | Key Metrics (session summary), Proximity & Orientation (per-second inter-animal distances and heading; 2-animal sessions only) |
+| `{name}_graphs_*.pdf` | Heatmaps, cascade (speed/accel/jerk), distance, feature oncoplot, synchrony oncoplot, feature-vs-distance |
+| `{name}_rf_*.csv/pdf` | Random Forest bout analysis results and plots (requires scikit-learn) |
+
+Export options are automatically greyed out for any outputs that depend on a module that was not selected during processing.
 
 ---
 
@@ -113,6 +136,8 @@ Running an export produces three Excel workbooks:
 | Video | OpenCV |
 | Gap filling | PCHIP interpolation, Kalman smoothing, linear fallback |
 | Export | openpyxl / Excel workbooks |
+| Graphs | matplotlib (optional) |
+| ML analysis | scikit-learn (optional) |
 
 ---
 
@@ -126,6 +151,16 @@ Running an export produces three Excel workbooks:
 
 ```bash
 pip install PySide6 numpy scipy pandas openpyxl h5py opencv-python pykalman
+```
+
+Optional (for graph PDFs):
+```bash
+pip install matplotlib
+```
+
+Optional (for Random Forest analysis):
+```bash
+pip install scikit-learn
 ```
 
 ### Run
@@ -142,9 +177,11 @@ python main.py
 2. Click **Load SLEAP** and select the `.h5` pose-estimation file.
 3. Draw the square arena ROI on the video frame.
 4. Enter arena size and border-strip settings.
-5. Click **Process** to fill gaps, smooth tracks, and compute features.
-6. Use **Inspect** to review per-frame values.
-7. Click **Export** to write the output workbooks.
+5. Click **Process** — a **Processing Options** dialog appears. Choose which analysis modules to run, then click **Analyze**.
+6. Use **Inspect** to review per-frame values in the data popup.
+7. Click **Export** — an **Export Options** dialog appears with outputs pre-gated by what was processed. Choose outputs and destination, then click **Export**.
+
+Processing options are remembered across re-runs within the same session.
 
 ---
 
@@ -153,11 +190,12 @@ python main.py
 ```text
 main.py             entry point
 main_window.py      application window shell
-run_popup.py        main analysis window: ROI, playback, export worker
+run_popup.py        main analysis window: ROI, playback, processing dialog, export worker
 preprocessing.py    gap filling, smoothing, kinematics
-behaviors.py        1st-order behavior detection
-features.py         animal and pair feature extraction
+behaviors.py        1st-order and pairwise behavior detection
+features.py         animal/pair feature extraction, proximity helpers, bout detection
 binned_export.py    time-binned aggregation and Excel export
+graph_export.py     PDF graph generation (heatmaps, cascade, oncoplots, distance)
 sleap_loader.py     SLEAP .h5 loader with layout auto-detection
 roi_view.py         interactive ROI drawing widget
 ```
@@ -170,6 +208,8 @@ roi_view.py         interactive ROI drawing widget
 - `frame_map` links video frame numbers to SLEAP data rows so exports stay aligned to the original recording.
 - DSR, the median inter-hip distance, acts as a body-scale reference for proximity thresholds.
 - Heavy processing runs away from the Qt main thread through `QThread` workers.
+- The analysis cache is computed once during processing and reused directly by the export worker — kinematics, behaviors, and feature arrays are never computed twice per session.
+- The first 5 seconds of each session are trimmed at processing time to exclude hand-placement noise; the trimmed tracks and adjusted frame map are stored in the cache.
 
 ---
 
