@@ -947,7 +947,9 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                      contact_frames / fps, 's')
 
             # General proximity/contact — minimum over all cross-animal node pairs
-            gen_dist, _ = _general_min_dist(tracks, sleap_idxs, tA, tB, node_names)
+            # Exclude tailend nodes: only tailstart counts as a contact/proximity point
+            gen_dist, _ = _general_min_dist(tracks, sleap_idxs, tA, tB, node_names,
+                                            exclude_idxs=_tailend_node_idxs(node_names))
             gen_prox_bin = np.isfinite(gen_dist) & (gen_dist <= prox_thresh_px)
             gen_prox_bin = _filter_short_active_bouts(gen_prox_bin, fps)
             _add('Proximity', 'General Proximity Time', pair_name,
@@ -1013,8 +1015,10 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
     delta_heading = np.abs(((heading_A - heading_B) + 180.0) % 360.0 - 180.0)  # [0, 180]
 
     # General min cross-animal node-pair distance for Within_3cm / Within_1cm
+    # Exclude tailend nodes: only tailstart counts as a contact/proximity point
     all_idxs = np.arange(n_frames)
-    gen_min_px, gen_closest = _general_min_dist(tracks, all_idxs, tA, tB, node_names)
+    gen_min_px, gen_closest = _general_min_dist(tracks, all_idxs, tA, tB, node_names,
+                                                exclude_idxs=_tailend_node_idxs(node_names))
     prox_px    = PROX_THRESHOLD_CM    * px_per_cm
     contact_px = CONTACT_THRESHOLD_CM * px_per_cm
 
