@@ -52,6 +52,46 @@ def _render_icon(size: int) -> QImage:
     return px.toImage().convertToFormat(QImage.Format_ARGB32)
 
 
+def _write_ico_manual(output_path: str, pil_images):
+    """Write an ICO file with PNG-compressed frames for all sizes.
+
+    Pillow's built-in ICO writer silently drops frames larger than 256 px.
+    This function writes the binary ICO format directly so that 512 px
+    (and any other large) frames are preserved as PNG-compressed entries,
+    which Windows Vista and later support natively.
+    """
+    import io, struct
+
+    png_chunks = []
+    for img in pil_images:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=False)
+        png_chunks.append(buf.getvalue())
+
+    n = len(png_chunks)
+    # ICO layout: 6-byte file header + n*16-byte directory + image data
+    header_size = 6 + n * 16
+    offsets = []
+    pos = header_size
+    for chunk in png_chunks:
+        offsets.append(pos)
+        pos += len(chunk)
+
+    with open(output_path, "wb") as f:
+        # File header
+        f.write(struct.pack("<HHH", 0, 1, n))
+        # Directory entries
+        for img, chunk, offset in zip(pil_images, png_chunks, offsets):
+            w, h = img.size
+            # Width/height byte: 0 means 256+ (Windows reads actual size from PNG)
+            bw = w if w < 256 else 0
+            bh = h if h < 256 else 0
+            f.write(struct.pack("<BBBBHHII", bw, bh, 0, 0, 1, 32, len(chunk), offset))
+        # Image data
+        for chunk in png_chunks:
+            f.write(chunk)
+
+
 def build_ico(output_path: str = "star_analyzer.ico"):
     app = QApplication.instance() or QApplication(sys.argv)
 
@@ -71,12 +111,10 @@ def build_ico(output_path: str = "star_analyzer.ico"):
         w, h = qimg.width(), qimg.height()
         pil_images.append(Image.frombytes("RGBA", (w, h), bytes(qimg.bits()), "raw", "BGRA"))
 
-    pil_images[0].save(
-        output_path,
-        format="ICO",
-        sizes=[(s, s) for s in sizes],
-        append_images=pil_images[1:],
-    )
+    # Pillow's ICO saver silently drops frames > 256px.  Build the ICO manually
+    # so that all sizes (including 512px) are stored as PNG-compressed frames,
+    # which Windows Vista+ supports natively.
+    _write_ico_manual(output_path, pil_images)
     print(f"Created {output_path} with sizes {sizes}")
 
 
