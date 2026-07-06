@@ -156,6 +156,147 @@ def _make_icon(kind: str) -> QIcon:
     return QIcon(px)
 
 
+def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> dict:
+    """Pure analysis computation — safe to call off the main thread."""
+    data = processed_data
+    tracks      = data["tracks"]
+    node_names  = data["node_names"]
+    track_names = data["track_names"]
+    frame_map   = data["frame_map"]
+
+    (rx0, ry0), (rx1, ry1), side = roi
+
+    po          = proc_opts or {}
+    do_single   = po.get('proc_single_beh', True)
+    do_pair     = po.get('proc_pair_beh', True)
+    do_features = po.get('proc_features', True)
+    do_zones    = po.get('proc_zones', True)
+    do_prox     = po.get('proc_proximity', True)
+
+    # Trim first 5 seconds (hand-placement buffer)
+    n_frames = tracks.shape[0]
+    analysis_start = min(int(5 * fps), n_frames)
+    valid_vframes = [vf for vf, si in frame_map.items() if si >= analysis_start]
+    analysis_start_vidframe = min(valid_vframes) if valid_vframes else 0
+    tracks = tracks[analysis_start:]
+    n_frames = tracks.shape[0]
+    frame_map = {vf: si - analysis_start
+                 for vf, si in frame_map.items()
+                 if si >= analysis_start}
+
+    n_tracks = tracks.shape[3]
+
+    kin = compute_kinematics(tracks, fps, node_names=node_names)
+
+    single_beh = (compute_single_animal(tracks, kin, node_names, fps, px_per_cm=px_per_cm)
+                  if do_single else {})
+
+    pair_beh = (compute_pairwise(tracks, node_names, fps, dsr=None, kin=kin)
+                if (do_pair and n_tracks >= 2) else {})
+
+    if do_features:
+        track_feat, pair_feat = precompute_feature_arrays(
+            tracks, kin, node_names, fps, roi=(rx0, ry0, rx1, ry1))
+    else:
+        track_feat, pair_feat = {}, {}
+
+    body_idx = find_node_idx(node_names, 'body')
+
+    cache = dict(
+        tracks=tracks, kin=kin,
+        single_beh=single_beh, pair_beh=pair_beh,
+        track_feat=track_feat, pair_feat=pair_feat,
+        node_names=node_names, track_names=track_names,
+        frame_map=frame_map, body_idx=body_idx,
+        inv_ppcm=1.0 / max(px_per_cm, 1e-9),
+        px_per_cm=px_per_cm,
+        proc_opts=po,
+        analysis_start_vidframe=analysis_start_vidframe,
+    )
+
+    # Metrics panel precomputes
+    sleap_idxs_arr = np.array(sorted(frame_map.values()))
+    si_to_pos = {int(si): pos for pos, si in enumerate(sleap_idxs_arr)}
+
+    ROLL_W = max(3, round(0.2 * fps))
+    speed_rolling = {}
+    for t in range(n_tracks):
+        spd = (kin['speed'][:, body_idx, t] if body_idx is not None
+               else np.nanmean(kin['speed'][:, :, t], axis=1))
+        speed_rolling[t] = (pd.Series(spd)
+                              .rolling(ROLL_W, center=True, min_periods=1)
+                              .mean().to_numpy())
+
+    if do_zones:
+        strip_px = strip_cm * px_per_cm
+        zone_label = {}
+        for t in range(n_tracks):
+            ni = body_idx if body_idx is not None else 0
+            x = tracks[:, 0, ni, t]
+            y = tracks[:, 1, ni, t]
+            near_h = np.minimum(x - rx0, rx1 - x) < strip_px
+            near_v = np.minimum(y - ry0, ry1 - y) < strip_px
+            lbl = np.full(n_frames, 'Center', dtype=object)
+            lbl[near_h ^ near_v] = 'Perimeter'
+            lbl[near_h & near_v] = 'Corner'
+            zone_label[t] = lbl
+    else:
+        zone_label = {}
+
+    prox_px = PROX_THRESHOLD_CM * px_per_cm
+    cont_px = CONTACT_THRESHOLD_CM * px_per_cm
+    if do_prox and n_tracks >= 2 and len(sleap_idxs_arr) > 0:
+        tailend_excl = _tailend_node_idxs(node_names)
+        gen_dist_tracked, gen_closest_tracked = _general_min_dist(
+            tracks, sleap_idxs_arr, 0, 1, node_names, exclude_idxs=tailend_excl)
+        prox_bouts   = _detect_bouts(gen_dist_tracked <= prox_px, fps)
+        cont_bouts   = _detect_bouts(gen_dist_tracked <= cont_px, fps)
+        prox_cumtime = np.cumsum((gen_dist_tracked <= prox_px).astype(float)) / fps
+        cont_cumtime = np.cumsum((gen_dist_tracked <= cont_px).astype(float)) / fps
+        hdg_diff = np.abs(kin['body_heading_deg'][:, 0]
+                          - kin['body_heading_deg'][:, 1]) % 360
+        hdg_diff = np.minimum(hdg_diff, 360 - hdg_diff)
+    else:
+        gen_dist_tracked = gen_closest_tracked = None
+        prox_bouts = cont_bouts = []
+        prox_cumtime = cont_cumtime = hdg_diff = None
+
+    cache.update(dict(
+        n_tracks=n_tracks, si_to_pos=si_to_pos,
+        speed_rolling=speed_rolling, zone_label=zone_label,
+        gen_dist_tracked=gen_dist_tracked, gen_closest_tracked=gen_closest_tracked,
+        prox_bouts=prox_bouts, cont_bouts=cont_bouts,
+        prox_cumtime=prox_cumtime, cont_cumtime=cont_cumtime,
+        hdg_diff=hdg_diff, prox_px=prox_px, cont_px=cont_px,
+    ))
+    return cache
+
+
+class _AnalysisWorker(QObject):
+    done  = Signal(object)   # completed cache dict
+    error = Signal(str)
+
+    def __init__(self, processed_data, fps, roi, px_per_cm, strip_cm, proc_opts):
+        super().__init__()
+        self._processed_data = processed_data
+        self._fps            = fps
+        self._roi            = roi
+        self._px_per_cm      = px_per_cm
+        self._strip_cm       = strip_cm
+        self._proc_opts      = proc_opts or {}
+
+    def run(self):
+        try:
+            self.done.emit(_run_analysis(
+                self._processed_data, self._fps,
+                self._roi, self._px_per_cm, self._strip_cm,
+                self._proc_opts,
+            ))
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
 class _ProcessWorker(QObject):
     progress = Signal(int)    # 0-100
     finished = Signal(object) # the completed processed_data dict
@@ -548,7 +689,7 @@ class _ExportWorker(QObject):
                         )
                     except Exception as _ge:
                         import traceback as _tb
-                        self.status.emit(f"Graph export error (skipped): {_ge}")
+                        self.status.emit(f"Graph export error (skipped): {_ge}\n" + _tb.format_exc())
 
             # ---- RF analysis (CSV + optional PDF) ----
             rf_paths = []
@@ -565,7 +706,7 @@ class _ExportWorker(QObject):
                     )
                 except Exception as _re:
                     import traceback as _tb
-                    self.status.emit(f"RF analysis error (skipped): {_re}")
+                    self.status.emit(f"RF analysis error (skipped): {_re}\n" + _tb.format_exc())
 
             parts = []
             if any_main:
@@ -1087,6 +1228,7 @@ class _MetricsPanel(QWidget):
         col2.addWidget(self._lbl('INTERACTION', 'hdr'))
         self._lbl_idist = self._lbl(); col2.addWidget(self._lbl_idist)
         self._lbl_chip  = self._lbl('Apart', 'apart'); col2.addWidget(self._lbl_chip)
+        self._chip_role = 'apart'
         self._lbl_hdg   = self._lbl(); col2.addWidget(self._lbl_hdg)
         col2.addStretch()
 
@@ -1237,9 +1379,11 @@ class _MetricsPanel(QWidget):
 
     def _set_chip(self, text, role):
         self._lbl_chip.setText(text)
-        self._lbl_chip.setProperty('role', role)
-        self._lbl_chip.style().unpolish(self._lbl_chip)
-        self._lbl_chip.style().polish(self._lbl_chip)
+        if role != self._chip_role:
+            self._chip_role = role
+            self._lbl_chip.setProperty('role', role)
+            self._lbl_chip.style().unpolish(self._lbl_chip)
+            self._lbl_chip.style().polish(self._lbl_chip)
 
 
 class _DataPopup(QWidget):
@@ -1531,7 +1675,12 @@ class RunPopUp(QWidget):
         self._timer           = QTimer(self)
         self._timer.setInterval(min(1000, max(1, int(1000 / self._fps))))
         self._timer.timeout.connect(self._advance_frame)
-        self._slider_dragging = False
+        self._slider_dragging    = False
+        self._slider_pending_val = None
+        self._slider_debounce    = QTimer(self)
+        self._slider_debounce.setSingleShot(True)
+        self._slider_debounce.setInterval(30)
+        self._slider_debounce.timeout.connect(self._on_slider_debounced)
         self._zones     = None   # dict zone_name → (x0,y0,x1,y1) native px, or None
         self._px_per_cm = None   # float, computed when ROI + cm spinbox are both valid
 
@@ -1694,6 +1843,8 @@ class RunPopUp(QWidget):
 
         self._worker = None
         self._proc_thread = None
+        self._analysis_worker = None
+        self._analysis_thread = None
         self._export_worker = None
         self._export_thread = None
 
@@ -1802,10 +1953,16 @@ class RunPopUp(QWidget):
         self._slider_dragging = True
 
     def _on_slider_moved(self, v):
-        self._show_frame(v)
+        self._slider_pending_val = v
+        self._slider_debounce.start()   # restart timer each pixel; fires once after 30ms quiet
+
+    def _on_slider_debounced(self):
+        if self._slider_pending_val is not None:
+            self._show_frame(self._slider_pending_val)
 
     def _on_slider_released(self):
         self._slider_dragging = False
+        self._slider_debounce.stop()
         self._show_frame(self._slider.value())
 
     # ---- ROI handlers --------------------------------------------------
@@ -1928,11 +2085,11 @@ class RunPopUp(QWidget):
             self._analysis_cache.clear()
             self._analysis_cache = None
         self._processed_sleap_data = processed_data
-        self._btn_process.setEnabled(True)
-        self._btn_process.setText("Process")
-        self._progress_bar.setVisible(False)
+        # Don't re-enable btn_process yet — analysis worker will do it
+        self._progress_bar.setVisible(True)   # keep visible for analysis phase
+        self._btn_process.setText("Analyzing…")
         self._precompute_analysis(proc_opts=getattr(self, '_proc_opts', None))
-        self._show_frame(self._index)
+        # _show_frame called from _on_analysis_done
 
     def _on_process_error(self, msg):
         self._btn_process.setEnabled(True)
@@ -1943,147 +2100,77 @@ class RunPopUp(QWidget):
     # ---- Analysis precompute & overlay ---------------------------------
 
     def _precompute_analysis(self, proc_opts=None):
-        """Cache kinematics, behaviors and features for overlay/popup use."""
-        if self._analysis_cache is not None:
-            self._analysis_cache.clear()
-            self._analysis_cache = None
+        """Start background analysis worker. UI remains responsive."""
         data = self._processed_sleap_data
         if data is None:
             return
-
-        tracks     = data["tracks"]
-        node_names = data["node_names"]
-        track_names= data["track_names"]
-        frame_map  = data["frame_map"]
-
         roi = self.view.roi_native()
         if roi is None:
-            # Overlay cm-unit values are meaningless without a calibrated ROI.
-            # The Process button requires an ROI, so this path is only reachable
-            # in unusual edge cases (e.g. ROI cleared after processing).
             return
-        (rx0, ry0), (rx1, ry1), side = roi
+
+        # Cancel any in-progress analysis
+        try:
+            if self._analysis_thread is not None and self._analysis_thread.isRunning():
+                self._analysis_thread.quit()
+                self._analysis_thread.wait(500)
+        except RuntimeError:
+            pass
+
+        # Clear stale cache
+        if self._analysis_cache is not None:
+            self._analysis_cache.clear()
+            self._analysis_cache = None
+
+        (_, _), (_, _), side = roi
         px_per_cm = side / max(self._spin_arena_cm.value(), 1)
+        strip_cm  = self._spin_strip_cm.value()
 
-        # Resolve processing options
-        po          = proc_opts or {}
-        do_single   = po.get('proc_single_beh', True)
-        do_pair     = po.get('proc_pair_beh', True)
-        do_features = po.get('proc_features', True)
-        do_zones    = po.get('proc_zones', True)
-        do_prox     = po.get('proc_proximity', True)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+        self._btn_process.setEnabled(False)
+        self._btn_process.setText("Analyzing…")
 
-        # ---- Trim first 5 seconds (hand placement buffer) ----
-        n_frames = tracks.shape[0]
-        analysis_start = min(int(5 * self._fps), n_frames)
-        # Find the first video frame at or after the analysis start
-        valid_vframes = [vf for vf, si in frame_map.items() if si >= analysis_start]
-        self._analysis_start_vidframe = min(valid_vframes) if valid_vframes else 0
-        tracks = tracks[analysis_start:]
-        n_frames = tracks.shape[0]
-        frame_map = {vf: si - analysis_start
-                     for vf, si in frame_map.items()
-                     if si >= analysis_start}
-
-        n_tracks = tracks.shape[3]
-
-        kin = compute_kinematics(tracks, self._fps, node_names=node_names)
-
-        single_beh = (compute_single_animal(tracks, kin, node_names, self._fps,
-                                            px_per_cm=px_per_cm)
-                      if do_single else {})
-
-        pair_beh = (compute_pairwise(tracks, node_names, self._fps, dsr=None, kin=kin)
-                    if (do_pair and n_tracks >= 2) else {})
-
-        if do_features:
-            track_feat, pair_feat = precompute_feature_arrays(
-                tracks, kin, node_names, self._fps,
-                roi=(rx0, ry0, rx1, ry1))
-        else:
-            track_feat, pair_feat = {}, {}
-
-        # Resolve body-center node index
-        body_idx = find_node_idx(node_names, 'body')
-
-        self._analysis_cache = dict(
-            tracks=tracks, kin=kin,
-            single_beh=single_beh, pair_beh=pair_beh,
-            track_feat=track_feat, pair_feat=pair_feat,
-            node_names=node_names, track_names=track_names,
-            frame_map=frame_map, body_idx=body_idx,
-            inv_ppcm=1.0 / max(px_per_cm, 1e-9),
-            px_per_cm=px_per_cm,
-            proc_opts=po,
+        self._analysis_worker = _AnalysisWorker(
+            data, self._fps, roi, px_per_cm, strip_cm, proc_opts or {}
         )
+        self._analysis_thread = QThread()
+        self._analysis_worker.moveToThread(self._analysis_thread)
 
-        # ---- Metrics panel precomputes (indexed by tracked position) ----
-        sleap_idxs_arr = np.array(sorted(frame_map.values()))
-        si_to_pos = {int(si): pos for pos, si in enumerate(sleap_idxs_arr)}
+        self._analysis_thread.started.connect(self._analysis_worker.run)
+        self._analysis_worker.done.connect(self._on_analysis_done)
+        self._analysis_worker.error.connect(self._on_analysis_error)
+        self._analysis_worker.done.connect(self._analysis_thread.quit)
+        self._analysis_worker.done.connect(self._analysis_worker.deleteLater)
+        self._analysis_worker.error.connect(self._analysis_thread.quit)
+        self._analysis_worker.error.connect(self._analysis_worker.deleteLater)
+        self._analysis_thread.finished.connect(self._analysis_thread.deleteLater)
 
-        ROLL_W = max(3, round(0.2 * self._fps))
-        speed_rolling = {}
-        for t in range(n_tracks):
-            spd = (kin['speed'][:, body_idx, t] if body_idx is not None
-                   else np.nanmean(kin['speed'][:, :, t], axis=1))
-            speed_rolling[t] = (pd.Series(spd)
-                                  .rolling(ROLL_W, center=True, min_periods=1)
-                                  .mean().to_numpy())
+        self._analysis_thread.start()
 
-        if do_zones:
-            strip_px = self._spin_strip_cm.value() * px_per_cm
-            zone_label = {}
-            for t in range(n_tracks):
-                ni = body_idx if body_idx is not None else 0
-                x = tracks[:, 0, ni, t]
-                y = tracks[:, 1, ni, t]
-                near_h = np.minimum(x - rx0, rx1 - x) < strip_px
-                near_v = np.minimum(y - ry0, ry1 - y) < strip_px
-                lbl = np.full(n_frames, 'Center', dtype=object)
-                lbl[near_h ^ near_v] = 'Perimeter'
-                lbl[near_h & near_v] = 'Corner'
-                zone_label[t] = lbl
-        else:
-            zone_label = {}
-
-        prox_px = PROX_THRESHOLD_CM * px_per_cm
-        cont_px = CONTACT_THRESHOLD_CM * px_per_cm
-        if do_prox and n_tracks >= 2 and len(sleap_idxs_arr) > 0:
-            tailend_excl = _tailend_node_idxs(node_names)
-            gen_dist_tracked, gen_closest_tracked = _general_min_dist(
-                tracks, sleap_idxs_arr, 0, 1, node_names, exclude_idxs=tailend_excl)
-            prox_bouts   = _detect_bouts(gen_dist_tracked <= prox_px, self._fps)
-            cont_bouts   = _detect_bouts(gen_dist_tracked <= cont_px, self._fps)
-            prox_cumtime = np.cumsum((gen_dist_tracked <= prox_px).astype(float)) / self._fps
-            cont_cumtime = np.cumsum((gen_dist_tracked <= cont_px).astype(float)) / self._fps
-            hdg_diff = np.abs(kin['body_heading_deg'][:, 0]
-                              - kin['body_heading_deg'][:, 1]) % 360
-            hdg_diff = np.minimum(hdg_diff, 360 - hdg_diff)
-        else:
-            gen_dist_tracked = gen_closest_tracked = None
-            prox_bouts = cont_bouts = []
-            prox_cumtime = cont_cumtime = hdg_diff = None
-
-        self._analysis_cache.update(dict(
-            n_tracks=n_tracks, si_to_pos=si_to_pos,
-            speed_rolling=speed_rolling, zone_label=zone_label,
-            gen_dist_tracked=gen_dist_tracked, gen_closest_tracked=gen_closest_tracked,
-            prox_bouts=prox_bouts, cont_bouts=cont_bouts,
-            prox_cumtime=prox_cumtime, cont_cumtime=cont_cumtime,
-            hdg_diff=hdg_diff, prox_px=prox_px, cont_px=cont_px,
-        ))
+    def _on_analysis_done(self, cache_dict):
+        self._analysis_cache = cache_dict
+        self._analysis_start_vidframe = cache_dict['analysis_start_vidframe']
+        self._progress_bar.setVisible(False)
+        self._btn_process.setEnabled(True)
+        self._btn_process.setText("Process")
         self._metrics_panel.clear()
-
-        # Build / rebuild the data popup
         if self._data_popup is None:
             self._data_popup = _DataPopup(self)
+        c = cache_dict
         self._data_popup.setup(
-            tracks, kin, single_beh, pair_beh,
-            track_feat, pair_feat,
-            node_names, track_names, self._fps, px_per_cm,
-            analysis_start_vidframe=self._analysis_start_vidframe)
-
+            c['tracks'], c['kin'], c['single_beh'], c['pair_beh'],
+            c['track_feat'], c['pair_feat'],
+            c['node_names'], c['track_names'], self._fps, c['px_per_cm'],
+            analysis_start_vidframe=c['analysis_start_vidframe'],
+        )
         self._btn_inspect.setEnabled(True)
+        self._show_frame(self._index)
+
+    def _on_analysis_error(self, msg):
+        self._progress_bar.setVisible(False)
+        self._btn_process.setEnabled(True)
+        self._btn_process.setText("Process")
+        _ScrollableMessageBox(self, "Analysis failed", msg, critical=True).exec()
 
     def _draw_analysis_overlay(self, frame, sleap_idx):
         """Info now shown in _MetricsPanel; this overlay is retired."""

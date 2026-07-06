@@ -30,7 +30,7 @@ def _make_star_icon(size: int = 32) -> QIcon:
     import math
 
     icon = QIcon()
-    for sz in ([size] if size != 32 else [16, 32, 48, 64]):
+    for sz in ([size] if size != 32 else [16, 32, 48, 64, 128, 256]):
         px = QPixmap(sz, sz)
         px.fill(QColor(0, 0, 0, 0))
         p = QPainter(px)

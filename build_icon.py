@@ -55,7 +55,7 @@ def _render_icon(size: int) -> QImage:
 def build_ico(output_path: str = "star_analyzer.ico"):
     app = QApplication.instance() or QApplication(sys.argv)
 
-    sizes = [16, 32, 48, 256]
+    sizes = [16, 32, 48, 128, 256]
     images = [_render_icon(s) for s in sizes]
 
     try:

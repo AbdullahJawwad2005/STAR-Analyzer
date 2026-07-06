@@ -17,7 +17,7 @@ import gc
 import numpy as np
 from itertools import combinations
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _CfTimeoutError
 from behaviors import find_node_idx
 
 # Agg backend MUST be set before importing pyplot
@@ -915,17 +915,29 @@ def write_graphs(zone_summary_df, track_arrays, pair_arrays, frame_map,
             node_names, fps, px_per_cm, status_cb)
 
     written = []
+    _GRAPH_TIMEOUT = 300  # seconds per graph task
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(fn): path for path, fn in tasks.items()}
         for fut in as_completed(futures):
             path = futures[fut]
             try:
-                fut.result()
+                fut.result(timeout=_GRAPH_TIMEOUT)
                 written.append(path)
+            except _CfTimeoutError:
+                fut.cancel()
+                if status_cb:
+                    status_cb(
+                        f"Graph error ({Path(path).stem}, timed out after "
+                        f"{_GRAPH_TIMEOUT}s — skipped)"
+                    )
             except Exception as exc:
                 if status_cb:
-                    status_cb(f"Graph error ({Path(path).stem}, skipped): {exc}")
+                    import traceback as _tb
+                    status_cb(
+                        f"Graph error ({Path(path).stem}, skipped): {exc}\n"
+                        + _tb.format_exc()
+                    )
 
     plt.close("all")
     gc.collect()
