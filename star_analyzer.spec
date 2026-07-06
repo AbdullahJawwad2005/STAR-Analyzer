@@ -55,9 +55,6 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         'tkinter',
-        'email',
-        'xml',
-        'xmlrpc',
     ],
     noarchive=False,
     optimize=0,
