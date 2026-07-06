@@ -402,6 +402,33 @@ def _general_min_dist(tracks, idxs, tA, tB, node_names, exclude_idxs=None):
     return min_dist, closest_pair
 
 
+def _region_min_dist(tracks, idxs, tA, tB, nodes_a, nodes_b):
+    """
+    Minimum cross-animal distance between two anatomical regions.
+
+    For symmetric pairs (nodes_a == nodes_b), computes nodes_a(tA)×nodes_b(tB).
+    For asymmetric pairs, also computes nodes_a(tB)×nodes_b(tA) and takes overall min.
+    """
+    def _cross(na, nb, t1, t2):
+        xa = tracks[idxs][:, 0, :, t1][:, na]          # (n, len_a)
+        ya = tracks[idxs][:, 1, :, t1][:, na]
+        xb = tracks[idxs][:, 0, :, t2][:, nb]          # (n, len_b)
+        yb = tracks[idxs][:, 1, :, t2][:, nb]
+        dx = xa[:, :, np.newaxis] - xb[:, np.newaxis, :]  # (n, len_a, len_b)
+        dy = ya[:, :, np.newaxis] - yb[:, np.newaxis, :]
+        return np.hypot(dx, dy).reshape(len(idxs), -1)
+
+    d1 = _cross(nodes_a, nodes_b, tA, tB)
+    if set(nodes_a) != set(nodes_b):
+        d2 = _cross(nodes_a, nodes_b, tB, tA)
+        all_d = np.concatenate([d1, d2], axis=1)
+    else:
+        all_d = d1
+
+    with np.errstate(all='ignore'):
+        return np.nanmin(all_d, axis=1)
+
+
 # ---------------------------------------------------------------------------
 # Pairwise features
 # ---------------------------------------------------------------------------
@@ -812,13 +839,14 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
         _add('Locomotion', 'Median Speed', tname, float(np.nanmedian(spd_cm)), 'cm/s')
         _add('Locomotion', 'P95 Speed', tname, float(np.nanpercentile(spd_cm, 95)), 'cm/s')
 
-        # Acceleration
-        if body_idx is not None:
-            acc = kin['accel'][sleap_idxs, body_idx, t]
-        else:
-            acc = np.nanmean(kin['accel'][sleap_idxs, :, t], axis=1)
+        # Acceleration (signed scalar: d(speed)/dt, so deceleration cancels acceleration)
+        scalar_acc = _speed_accel(spd_cm, fps)
         _add('Locomotion', 'Avg Acceleration', tname,
-             float(np.nanmean(acc / px_per_cm)), 'cm/s²')
+             float(np.nanmean(scalar_acc)), 'cm/s²')
+        _add('Locomotion', 'Avg Abs Acceleration', tname,
+             float(np.nanmean(np.abs(scalar_acc))), 'cm/s²')
+        _add('Locomotion', 'P95 Abs Acceleration', tname,
+             float(np.nanpercentile(np.abs(scalar_acc), 95)), 'cm/s²')
 
         # Immobility (1-second minimum bout filter)
         if 'stationary' in single_beh:
@@ -878,58 +906,26 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                 cm_B = _cm_pos(tracks, body_idx, tB)[sleap_idxs]
                 inter = np.hypot(cm_A[:, 0] - cm_B[:, 0], cm_A[:, 1] - cm_B[:, 1])
 
-            def _node_pair_dist(idx_a, idx_b):
-                """Euclidean distance between node idx_a on tA and idx_b on tB."""
-                xa = tracks[sleap_idxs, 0, idx_a, tA]
-                ya = tracks[sleap_idxs, 1, idx_a, tA]
-                xb = tracks[sleap_idxs, 0, idx_b, tB]
-                yb = tracks[sleap_idxs, 1, idx_b, tB]
-                return np.hypot(xa - xb, ya - yb)
+            # Anatomical region definitions
+            head_nodes = [i for i in [nose_idx, ear_l_idx, ear_r_idx] if i is not None]
+            body_nodes = [i for i in [body_idx, hip_l_idx, hip_r_idx] if i is not None]
+            tail_nodes  = [i for i in [tail_idx]                       if i is not None]
 
-            def _head_centroid(t_idx):
-                """Average of ear_l and ear_r positions; fall back to nose."""
-                if ear_l_idx is not None and ear_r_idx is not None:
-                    x = (tracks[sleap_idxs, 0, ear_l_idx, t_idx] +
-                         tracks[sleap_idxs, 0, ear_r_idx, t_idx]) / 2.0
-                    y = (tracks[sleap_idxs, 1, ear_l_idx, t_idx] +
-                         tracks[sleap_idxs, 1, ear_r_idx, t_idx]) / 2.0
-                    return x, y
-                if nose_idx is not None:
-                    return (tracks[sleap_idxs, 0, nose_idx, t_idx],
-                            tracks[sleap_idxs, 1, nose_idx, t_idx])
-                return None, None
-
-            # Build distance arrays for each node-pair type
             dist_pairs = {}
-            dist_pairs['Body-Body'] = inter
-
             if nose_idx is not None:
-                dist_pairs['Nose-Nose'] = _node_pair_dist(nose_idx, nose_idx)
-
-            hx_A, hy_A = _head_centroid(tA)
-            hx_B, hy_B = _head_centroid(tB)
-            if hx_A is not None and hx_B is not None:
-                dist_pairs['Head-Head'] = np.hypot(hx_A - hx_B, hy_A - hy_B)
-
-            if nose_idx is not None and body_idx is not None:
-                # min of (noseA→bodyB, noseB→bodyA)
-                d1 = _node_pair_dist(nose_idx, body_idx)
-                # Reverse: nose of tB to body of tA
-                xa = tracks[sleap_idxs, 0, nose_idx, tB]
-                ya = tracks[sleap_idxs, 1, nose_idx, tB]
-                xb = tracks[sleap_idxs, 0, body_idx, tA]
-                yb = tracks[sleap_idxs, 1, body_idx, tA]
-                d2 = np.hypot(xa - xb, ya - yb)
-                dist_pairs['Nose-Body'] = np.minimum(d1, d2)
-
-            if nose_idx is not None and tail_idx is not None:
-                d1 = _node_pair_dist(nose_idx, tail_idx)
-                xa = tracks[sleap_idxs, 0, nose_idx, tB]
-                ya = tracks[sleap_idxs, 1, nose_idx, tB]
-                xb = tracks[sleap_idxs, 0, tail_idx, tA]
-                yb = tracks[sleap_idxs, 1, tail_idx, tA]
-                d2 = np.hypot(xa - xb, ya - yb)
-                dist_pairs['Nose-Tail'] = np.minimum(d1, d2)
+                dist_pairs['Nose-Nose'] = _region_min_dist(tracks, sleap_idxs, tA, tB, [nose_idx], [nose_idx])
+            if head_nodes:
+                dist_pairs['Head-Head']  = _region_min_dist(tracks, sleap_idxs, tA, tB, head_nodes, head_nodes)
+                if body_nodes:
+                    dist_pairs['Head-Body'] = _region_min_dist(tracks, sleap_idxs, tA, tB, head_nodes, body_nodes)
+                if tail_nodes:
+                    dist_pairs['Head-Tail'] = _region_min_dist(tracks, sleap_idxs, tA, tB, head_nodes, tail_nodes)
+            if body_nodes:
+                dist_pairs['Body-Body']  = _region_min_dist(tracks, sleap_idxs, tA, tB, body_nodes, body_nodes)
+                if tail_nodes:
+                    dist_pairs['Body-Tail'] = _region_min_dist(tracks, sleap_idxs, tA, tB, body_nodes, tail_nodes)
+            if tail_nodes:
+                dist_pairs['Tail-Tail']  = _region_min_dist(tracks, sleap_idxs, tA, tB, tail_nodes, tail_nodes)
 
             # Proximity and contact times (1-second minimum bout filter)
             for label, dist_arr in dist_pairs.items():
@@ -996,17 +992,6 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
     hip_r_idx = find_node_idx(node_names, 'hip_r')
     tail_idx  = find_node_idx(node_names, 'tail')
 
-    # Canonical node order for distance columns
-    canonical_nodes = [
-        ('nose',   nose_idx,  'nose_dist_cm'),
-        ('ear_l',  ear_l_idx, 'ear_l_dist_cm'),
-        ('ear_r',  ear_r_idx, 'ear_r_dist_cm'),
-        ('body',   body_idx,  'body_dist_cm'),
-        ('hip_l',  hip_l_idx, 'hip_l_dist_cm'),
-        ('hip_r',  hip_r_idx, 'hip_r_dist_cm'),
-        ('tail',   tail_idx,  'tail_dist_cm'),
-    ]
-
     # Use first pair (tA=0, tB=1)
     tA, tB = 0, 1
 
@@ -1021,6 +1006,27 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
                                                 exclude_idxs=_tailend_node_idxs(node_names))
     prox_px    = PROX_THRESHOLD_CM    * px_per_cm
     contact_px = CONTACT_THRESHOLD_CM * px_per_cm
+
+    # Anatomical region distances — precomputed for all frames
+    head_nodes = [i for i in [nose_idx, ear_l_idx, ear_r_idx] if i is not None]
+    body_nodes = [i for i in [body_idx, hip_l_idx, hip_r_idx] if i is not None]
+    tail_nodes  = [i for i in [tail_idx]                       if i is not None]
+
+    region_dist_arrays = {}
+    if nose_idx is not None:
+        region_dist_arrays['nose_nose_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, [nose_idx], [nose_idx])
+    if head_nodes:
+        region_dist_arrays['head_head_dist_cm']  = _region_min_dist(tracks, all_idxs, tA, tB, head_nodes, head_nodes)
+        if body_nodes:
+            region_dist_arrays['head_body_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, head_nodes, body_nodes)
+        if tail_nodes:
+            region_dist_arrays['head_tail_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, head_nodes, tail_nodes)
+    if body_nodes:
+        region_dist_arrays['body_body_dist_cm']  = _region_min_dist(tracks, all_idxs, tA, tB, body_nodes, body_nodes)
+        if tail_nodes:
+            region_dist_arrays['body_tail_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, body_nodes, tail_nodes)
+    if tail_nodes:
+        region_dist_arrays['tail_tail_dist_cm']  = _region_min_dist(tracks, all_idxs, tA, tB, tail_nodes, tail_nodes)
 
     # Group frame_map into 1-second bins keyed by integer second
     bins = {}
@@ -1052,22 +1058,13 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
         row = {'Time(s)': sec, 'Within_3cm': within_3, 'Within_1cm': within_1,
                'closest_pair': closest, 'Heading_Angle_deg': round(ha, 2)}
 
-        # Per-node distances
-        for _cname, idx, col in canonical_nodes:
-            if idx is None:
-                continue
-            xa = tracks[idxs, 0, idx, tA]; ya = tracks[idxs, 1, idx, tA]
-            xb = tracks[idxs, 0, idx, tB]; yb = tracks[idxs, 1, idx, tB]
-            d_px = np.hypot(xa - xb, ya - yb)
-            row[col] = round(float(np.nanmean(d_px)) / px_per_cm, 4)
+        for col, arr_px in region_dist_arrays.items():
+            row[col] = round(float(np.nanmean(arr_px[idxs])) / px_per_cm, 4)
 
         rows.append(row)
 
-    # Build ordered columns
     col_order = ['Time(s)', 'Within_3cm', 'Within_1cm', 'closest_pair', 'Heading_Angle_deg']
-    for _cname, idx, col in canonical_nodes:
-        if idx is not None:
-            col_order.append(col)
+    col_order += list(region_dist_arrays.keys())
 
     return pd.DataFrame(rows, columns=col_order)
 
