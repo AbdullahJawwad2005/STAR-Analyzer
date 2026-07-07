@@ -213,6 +213,28 @@ roi_view.py         interactive ROI drawing widget
 
 ---
 
+## Testing
+
+A suite of headless tests verifies core pipeline correctness without requiring a display or real SLEAP file.
+
+| Test file | What it covers |
+|---|---|
+| `test_key_metrics.py` | 119 ground-truth checks across 8 pipeline sections: distance/proximity, speed rolling, body heading, zone labeling, bout detection, cumulative tally, behavior states, MetricsPanel integration |
+| `test_export_dialog.py` | ExportOptionsDialog init, proc\_opts gating, master/group checkbox sync, ProcessingOptionsDialog defaults |
+| `test_conversions.py` | Unit conversion correctness (px/cm, speed, distance) |
+| `test_oncoplot.py` | Oncoplot binning, aggregation, and normalization with hand-calculable synthetic data |
+
+```bash
+python test_key_metrics.py
+python test_export_dialog.py
+python test_conversions.py
+python test_oncoplot.py
+```
+
+All tests exit with code `0` on success. Every check prints `PASS`/`FAIL` with `got=`/`expected=` evidence on failure so failures are self-documenting without reading the test source.
+
+---
+
 ## Status
 
 Active undergraduate research software project for computational behavioral analysis.

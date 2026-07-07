@@ -245,7 +245,7 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> d
 
     prox_px = PROX_THRESHOLD_CM * px_per_cm
     cont_px = CONTACT_THRESHOLD_CM * px_per_cm
-    if do_prox and n_tracks >= 2 and len(sleap_idxs_arr) > 0:
+    if n_tracks >= 2 and len(sleap_idxs_arr) > 0:
         tailend_excl = _tailend_node_idxs(node_names)
         gen_dist_tracked, gen_closest_tracked = _general_min_dist(
             tracks, sleap_idxs_arr, 0, 1, node_names, exclude_idxs=tailend_excl)
@@ -723,6 +723,8 @@ class _ExportWorker(QObject):
             del tracks, kin, single_beh, pair_beh, track_arrays, pair_arrays
             self.finished.emit(msg)
 
+        except PermissionError as exc:
+            self.error.emit(str(exc))
         except Exception as exc:
             import traceback
             self.error.emit(traceback.format_exc())
@@ -1267,7 +1269,16 @@ class _MetricsPanel(QWidget):
         if cache is None:
             self.clear()
             return
+        try:
+            self._refresh_inner(sleap_idx, video_frame_idx, n_frames, fps,
+                                analysis_start_vidframe, cache)
+        except Exception:
+            import traceback, logging
+            logging.getLogger(__name__).error(
+                "MetricsPanel.refresh() failed:\n%s", traceback.format_exc())
 
+    def _refresh_inner(self, sleap_idx, video_frame_idx, n_frames, fps,
+                       analysis_start_vidframe, cache):
         inv_ppcm    = cache['inv_ppcm']
         kin         = cache['kin']
         single_beh  = cache['single_beh']
@@ -1336,8 +1347,12 @@ class _MetricsPanel(QWidget):
             else:
                 self._set_chip('Apart', 'apart')
         else:
-            self._lbl_idist.setText('Dist: —')
-            self._set_chip('—', 'apart')
+            if cache.get('n_tracks', 1) < 2:
+                self._lbl_idist.setText('Dist: N/A (1 animal)')
+                self._set_chip('N/A', 'apart')
+            else:
+                self._lbl_idist.setText('Dist: —')
+                self._set_chip('—', 'apart')
 
         hdg_diff = cache.get('hdg_diff')
         if hdg_diff is not None and sleap_idx < len(hdg_diff):
@@ -1361,6 +1376,9 @@ class _MetricsPanel(QWidget):
             elapsed_b = (tracked_idx - bout_start) / fps
             self._lbl_btype.setText(f'{bout_type} (General)')
             self._lbl_belap.setText(f'Elapsed: {elapsed_b:.1f}s')
+        elif tracked_idx is None and cache.get('n_tracks', 1) < 2:
+            self._lbl_btype.setText('N/A (1 animal)')
+            self._lbl_belap.setText('')
         else:
             self._lbl_btype.setText('none')
             self._lbl_belap.setText('')

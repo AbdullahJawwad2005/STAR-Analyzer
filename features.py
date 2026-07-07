@@ -615,11 +615,19 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
 # ---------------------------------------------------------------------------
 
 def _tailend_node_idxs(node_names):
-    """Return a set of node indices whose stripped name matches tailend aliases."""
+    """Return a set of node indices whose stripped name matches tailend aliases.
+
+    If a tailstart node is present, bare 'tail' nodes are also treated as
+    tailend (handles skeletons that name the end node 'tail1' etc.).
+    """
     _tailend_pats = {'tailend', 'tail_end', 'te'}
+    stripped = [n.lower().rstrip('0123456789') for n in node_names]
+    _tailstart_pats = {'tailstart', 'tail_base', 'tailbase', 'tb'}
+    if any(s in _tailstart_pats for s in stripped):
+        _tailend_pats = _tailend_pats | {'tail'}
     out = set()
-    for i, n in enumerate(node_names):
-        if n.lower().rstrip('0123456789') in _tailend_pats:
+    for i, s in enumerate(stripped):
+        if s in _tailend_pats:
             out.add(i)
     return out
 

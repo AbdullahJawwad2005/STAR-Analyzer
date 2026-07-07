@@ -364,6 +364,14 @@ buckets (`int(vid_frame // fps)`) and computes:
 Canonical column order: `nose, ear_l, ear_r, body, hip_l, hip_r, tail`. Absent nodes are
 omitted. Only called when `n_tracks >= 2`; written as sheet 2 of `{stem}_key_metrics.xlsx`.
 
+**`_tailend_node_idxs` — tailstart-aware exclusion:**
+If the skeleton contains a tailstart node (`tailstart`, `tail_base`, `tailbase`, `tb`),
+bare `tail` nodes (e.g. `tail1`, `tail2`) are also treated as tailend nodes and excluded
+from the minimum inter-animal distance computation. This handles skeletons that name the
+distal tail node `tail` rather than `tailend`. Without this, a node named `tail` in a
+skeleton that also has `tail_base` would not be excluded, letting nearby tail tips
+erroneously collapse the reported inter-animal distance to near-zero.
+
 ### Things to check
 - `_shape_features_per_track` has a Python `for f in range(n_frames)` loop doing PCA per
   frame. This is O(n_frames × n_nodes²) and is the slowest part of `features.py`. For 10,000
@@ -629,6 +637,32 @@ The cache is the single source of truth for both the live overlay and the export
 | `body_idx` | `int\|None` | Body-centre node index |
 | `proc_opts` | `dict` | The resolved option flags |
 
+### `gen_dist_tracked` — always computed for live overlay
+
+Previously `gen_dist_tracked` (the raw inter-animal minimum distance array used by
+`_MetricsPanel`) was only computed inside the `if do_prox:` block, so the live distance
+readout in the metrics panel would be empty when the user skipped proximity analysis.
+It is now computed whenever `n_tracks >= 2`, independent of `proc_proximity`. The
+per-bout statistics still require `do_prox=True`; only the frame-level distances are
+unconditionally available.
+
+### `_MetricsPanel.refresh` error isolation
+
+`refresh()` now delegates to `_refresh_inner()` inside a `try/except`. Any unhandled
+exception is logged via `logging.getLogger(__name__)` with the message prefix
+`"MetricsPanel.refresh() failed:"` and a full traceback. This prevents a broken metric
+computation from freezing video playback — the overlay simply shows stale labels rather
+than crashing. The single-animal case (n\_tracks < 2) now explicitly shows
+`"N/A (1 animal)"` instead of `"—"` for distance and behavior-type labels.
+
+### `PermissionError` in `_ExportWorker`
+
+`_ExportWorker.run()` now catches `PermissionError` before the generic `Exception`
+handler. When a file is open in Excel and the worker tries to overwrite it, the error
+signal receives the plain `str(exc)` message (e.g. "Permission denied: /path/to.xlsx")
+rather than a full traceback, making it actionable for the user without looking like
+an internal crash.
+
 ### Things to check
 - `_precompute_analysis` runs on the main thread (called from `_on_process_done`, a slot).
   For large sessions this could stutter the UI briefly. It is not wrapped in a QThread.
@@ -804,7 +838,30 @@ write_binned_xlsx(track_arrays, pair_arrays, single_beh, pair_beh,
 
 ---
 
-## 12. Reviewer Checklist
+## 12. Test Suite
+
+Four headless test files ship alongside the source. All use the same `check(name, got, expected)`
+harness (global `PASS`/`FAIL` counters, `sys.exit(FAIL)`). Run all four before any commit that
+touches the files they cover.
+
+| File | Covers | Checks |
+|------|--------|--------|
+| `test_key_metrics.py` | `_general_min_dist`, speed/rolling, body heading, zone labeling, bout detection, cumulative tally, behavior states, `_MetricsPanel` integration | 119 |
+| `test_export_dialog.py` | `ExportOptionsDialog` init / gating / checkbox sync, `ProcessingOptionsDialog` | ~30 |
+| `test_conversions.py` | px→cm, speed, distance unit conversions | ~10 |
+| `test_oncoplot.py` | Oncoplot binning, aggregation, normalisation pipeline | ~20 |
+
+**Invariants tested by `test_key_metrics.py`:**
+- `_general_min_dist` returns correct Euclidean minimum with and without tailend exclusion, and propagates NaN.
+- `_detect_bouts` bridging/filtering logic at fps=10 and fps=30 (including banker's rounding).
+- `angular_velocity` wraps through 0°/360° without phantom spikes (the critical failure case).
+- Zone labeling classifies Center / Perimeter / Corner correctly at boundary-exact positions.
+- Cumulative proximity time satisfies monotonicity and `contact ≤ proximity ≤ total_time`.
+- `_MetricsPanel.refresh()` shows "N/A (1 animal)" for single-track cache and clears to `'—'` for `None` cache.
+
+---
+
+## 13. Reviewer Checklist
 
 Use this as a structured checklist when reading through the code:
 
@@ -843,6 +900,11 @@ Use this as a structured checklist when reading through the code:
       **This may be a bug** — `BinTime_1s(s)` should probably be `_1s_bin * 1.0` to match
       the `BinTime(s)` convention in the 0.25 s sheets.)
 
+### features.py
+- [ ] Does `_tailend_node_idxs` correctly extend to bare `tail*` nodes only when a
+      tailstart node is present? (Prevents false-positive exclusion in skeletons with no
+      tail_base but a node literally named `tail`)
+
 ### run_popup.py
 - [ ] Are all `QThread` workers properly cleaned up (`deleteLater` on both `finished` and
       `error` paths)?
@@ -861,6 +923,13 @@ Use this as a structured checklist when reading through the code:
 - [ ] Does `_PROC_GATES` in `ExportOptionsDialog` cover every export option that depends
       on a selective processing module? Any new export option must be manually added here.
 - [ ] Does `ProcessingOptionsDialog` correctly disable the pair group when `n_tracks < 2`?
+- [ ] Does `gen_dist_tracked` get populated when `n_tracks >= 2` regardless of `do_prox`?
+      (Needed so `_MetricsPanel` can show live distance even when proximity analysis was skipped)
+- [ ] Does `_MetricsPanel.refresh()` catch all exceptions without propagating to the
+      playback timer? Verify the `logging.getLogger(__name__)` call uses `__name__` not a
+      hardcoded string, so log filtering by module name works.
+- [ ] Does `_ExportWorker` catch `PermissionError` before `Exception`? Without this, the
+      user sees a raw traceback rather than an actionable file-locked message.
 
 ---
 
