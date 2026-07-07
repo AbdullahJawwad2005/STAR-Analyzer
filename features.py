@@ -24,7 +24,7 @@ try:
 except ImportError:
     _SCIPY_OK = False
 
-from behaviors import find_node_idx, angular_velocity
+from behaviors import find_node_idx, angular_velocity, _fill_short_gaps
 
 PROX_THRESHOLD_CM    = 3.0   # general proximity threshold (cm)
 CONTACT_THRESHOLD_CM = 1.0   # general contact threshold (cm)
@@ -293,9 +293,9 @@ def _path_efficiency(cm_x, cm_y, fps):
 
 
 def _speed_accel(speed_arr, fps):
-    """d(speed)/dt — rate of change of speed magnitude. (n_frames,)"""
-    clean = np.nan_to_num(speed_arr, nan=0.0)
-    return np.gradient(clean) * fps
+    """d(speed)/dt — rate of change of speed magnitude. (n_frames,)
+    NaN-safe: gap-boundary frames produce NaN output, not artificial spikes."""
+    return np.gradient(np.asarray(speed_arr, dtype=np.float64)) * fps
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +594,7 @@ def precompute_feature_arrays(tracks, kin, node_names, fps, roi=None):
 
         body_spd = (kin['speed'][:, body_idx, t] if body_idx is not None
                     else np.nanmean(kin['speed'][:, :, t], axis=1))
-        fa['speed_accel'] = _speed_accel(body_spd, fps)
+        fa['speed_accel'] = np.abs(_speed_accel(body_spd, fps))
         fa['body_heading_deg'] = kin['body_heading_deg'][:, t]
 
         fa['cm_total_disp'] = (node_disp[body_idx] if body_idx is not None
@@ -791,6 +791,64 @@ def _filter_short_active_bouts(arr, fps, min_dur_s=1.0):
     return out
 
 
+def _compute_bout_second_marks(dist_seq, frame_map, fps, threshold_px):
+    """
+    Per-second binary marks based on ≥1-second proximity bouts.
+
+    A second is marked 1 if qualifying-bout frames (after gap-fill and min-bout
+    filter) cover >50% of that second. On a tie (exactly 50%), the second
+    containing the bout start wins (earlier second takes precedence).
+
+    Parameters
+    ----------
+    dist_seq     : (N,) float — distances in sorted(frame_map) video-frame order
+    frame_map    : {vid_frame: sleap_idx}
+    fps          : float
+    threshold_px : float — distance threshold in pixels
+
+    Returns
+    -------
+    marks : dict {second_index: 0 or 1}
+    """
+    sorted_vf = sorted(frame_map.keys())
+    dist_seq  = np.asarray(dist_seq, dtype=np.float64)
+
+    # 1. Frame-level binary
+    raw = (np.isfinite(dist_seq) & (dist_seq <= threshold_px)).astype(np.int8)
+
+    # 2. Jitter removal: fill gaps < 0.2 s
+    max_gap = max(1, round(0.2 * fps))
+    filled  = _fill_short_gaps(raw, max_gap)
+
+    # 3. Minimum-bout filter: keep only runs >= 1 second
+    qualified = _filter_short_active_bouts(
+        filled.astype(np.float64), fps, min_dur_s=1.0).astype(bool)
+
+    # 4. Bout-start positions -> seconds (for tie-breaking)
+    padded = np.concatenate(([False], qualified, [False]))
+    d = np.diff(padded.astype(np.int8))
+    start_secs = {int(sorted_vf[p] // fps) for p in np.where(d == 1)[0]}
+
+    # 5. Per-second mark
+    n_exp = round(fps)
+    sec_active: dict = {}
+    sec_set:    set  = set()
+    for pos, vf in enumerate(sorted_vf):
+        sec = int(vf // fps)
+        sec_set.add(sec)
+        if qualified[pos]:
+            sec_active[sec] = sec_active.get(sec, 0) + 1
+
+    marks: dict = {}
+    for sec in sorted(sec_set):
+        n = sec_active.get(sec, 0)
+        if n * 2 > n_exp or (n * 2 == n_exp and sec in start_secs):
+            marks[sec] = 1
+        else:
+            marks[sec] = 0
+    return marks
+
+
 # ---------------------------------------------------------------------------
 # Key Metrics summary (one-glance overview sheet)
 # ---------------------------------------------------------------------------
@@ -847,14 +905,12 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
         _add('Locomotion', 'Median Speed', tname, float(np.nanmedian(spd_cm)), 'cm/s')
         _add('Locomotion', 'P95 Speed', tname, float(np.nanpercentile(spd_cm, 95)), 'cm/s')
 
-        # Acceleration (signed scalar: d(speed)/dt, so deceleration cancels acceleration)
-        scalar_acc = _speed_accel(spd_cm, fps)
-        _add('Locomotion', 'Avg Acceleration', tname,
-             float(np.nanmean(scalar_acc)), 'cm/s²')
+        # Scalar absolute acceleration: |d(speed)/dt|, averaged over all frames
+        abs_acc = np.abs(_speed_accel(spd_cm, fps))
         _add('Locomotion', 'Avg Abs Acceleration', tname,
-             float(np.nanmean(np.abs(scalar_acc))), 'cm/s²')
+             float(np.nanmean(abs_acc)), 'cm/s²')
         _add('Locomotion', 'P95 Abs Acceleration', tname,
-             float(np.nanpercentile(np.abs(scalar_acc), 95)), 'cm/s²')
+             float(np.nanpercentile(abs_acc, 95)), 'cm/s²')
 
         # Immobility (1-second minimum bout filter)
         if 'stationary' in single_beh:
@@ -956,13 +1012,21 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                                             exclude_idxs=_tailend_node_idxs(node_names))
             gen_prox_bin = np.isfinite(gen_dist) & (gen_dist <= prox_thresh_px)
             gen_prox_bin = _filter_short_active_bouts(gen_prox_bin, fps)
-            _add('Proximity', 'General Proximity Time', pair_name,
-                 float(np.nansum(gen_prox_bin)) / fps, 's')
+            _add('Proximity', 'General Proximity Time (2dp)', pair_name,
+                 round(float(np.nansum(gen_prox_bin)) / fps, 2), 's')
 
             gen_cont_bin = np.isfinite(gen_dist) & (gen_dist <= contact_thresh_px)
             gen_cont_bin = _filter_short_active_bouts(gen_cont_bin, fps)
-            _add('Contact', 'General Contact Time', pair_name,
-                 float(np.nansum(gen_cont_bin)) / fps, 's')
+            _add('Contact', 'General Contact Time (2dp)', pair_name,
+                 round(float(np.nansum(gen_cont_bin)) / fps, 2), 's')
+
+            # Binned: whole-second counts from the P&O sheet logic (≥1 s bouts, gap-filled)
+            prox_marks_km = _compute_bout_second_marks(gen_dist, frame_map, fps, prox_thresh_px)
+            cont_marks_km = _compute_bout_second_marks(gen_dist, frame_map, fps, contact_thresh_px)
+            _add('Proximity', 'General Proximity Time (1s bouts)', pair_name,
+                 float(sum(prox_marks_km.values())), 's')
+            _add('Contact', 'General Contact Time (1s bouts)', pair_name,
+                 float(sum(cont_marks_km.values())), 's')
 
             # Mean angle when proximal (body-body ≤ 3cm)
             app_A_key = f'{pfx}/approach_angle_A'
@@ -1042,14 +1106,19 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
         sec = int(vid_frame // fps)
         bins.setdefault(sec, []).append(sleap_idx)
 
+    # Bout-aware per-second marks for Within_3cm / Within_1cm
+    _sorted_vf = sorted(frame_map.keys())
+    _dist_seq  = gen_min_px[np.array([frame_map[f] for f in _sorted_vf])]
+    prox_marks = _compute_bout_second_marks(_dist_seq, frame_map, fps, prox_px)
+    cont_marks = _compute_bout_second_marks(_dist_seq, frame_map, fps, contact_px)
+
     rows = []
     for sec in sorted(bins):
         idxs = np.array(bins[sec])
 
-        # Within_3cm / Within_1cm: any-frame general min-dist logic
-        gd = gen_min_px[idxs]
-        within_3 = int(np.any(gd <= prox_px))
-        within_1 = int(np.any(gd <= contact_px))
+        gd       = gen_min_px[idxs]          # still needed for closest_pair below
+        within_3 = prox_marks.get(sec, 0)
+        within_1 = cont_marks.get(sec, 0)
 
         # Closest pair: mode among this second's frames
         cp_sec = gen_closest[idxs]
