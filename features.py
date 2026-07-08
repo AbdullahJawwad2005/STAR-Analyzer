@@ -402,6 +402,24 @@ def _general_min_dist(tracks, idxs, tA, tB, node_names, exclude_idxs=None):
     return min_dist, closest_pair
 
 
+def _region_min_dist_slab(xA, yA, xB, yB, nodes_a, nodes_b):
+    """Min cross-animal region distance from pre-extracted (n, n_nodes) slabs."""
+    xa = xA[:, nodes_a]; ya = yA[:, nodes_a]
+    xb = xB[:, nodes_b]; yb = yB[:, nodes_b]
+    dx = xa[:, :, np.newaxis] - xb[:, np.newaxis, :]
+    dy = ya[:, :, np.newaxis] - yb[:, np.newaxis, :]
+    d = np.hypot(dx, dy).reshape(len(xA), -1)
+    if set(nodes_a) == set(nodes_b):
+        with np.errstate(all='ignore'):
+            return np.nanmin(d, axis=1)
+    # asymmetric: also compute reverse swap
+    dx2 = xB[:, nodes_a][:, :, np.newaxis] - xA[:, nodes_b][:, np.newaxis, :]
+    dy2 = yB[:, nodes_a][:, :, np.newaxis] - yA[:, nodes_b][:, np.newaxis, :]
+    d2 = np.hypot(dx2, dy2).reshape(len(xA), -1)
+    with np.errstate(all='ignore'):
+        return np.nanmin(np.concatenate([d, d2], axis=1), axis=1)
+
+
 def _region_min_dist(tracks, idxs, tA, tB, nodes_a, nodes_b):
     """
     Minimum cross-animal distance between two anatomical regions.
@@ -409,24 +427,10 @@ def _region_min_dist(tracks, idxs, tA, tB, nodes_a, nodes_b):
     For symmetric pairs (nodes_a == nodes_b), computes nodes_a(tA)×nodes_b(tB).
     For asymmetric pairs, also computes nodes_a(tB)×nodes_b(tA) and takes overall min.
     """
-    def _cross(na, nb, t1, t2):
-        xa = tracks[idxs][:, 0, :, t1][:, na]          # (n, len_a)
-        ya = tracks[idxs][:, 1, :, t1][:, na]
-        xb = tracks[idxs][:, 0, :, t2][:, nb]          # (n, len_b)
-        yb = tracks[idxs][:, 1, :, t2][:, nb]
-        dx = xa[:, :, np.newaxis] - xb[:, np.newaxis, :]  # (n, len_a, len_b)
-        dy = ya[:, :, np.newaxis] - yb[:, np.newaxis, :]
-        return np.hypot(dx, dy).reshape(len(idxs), -1)
-
-    d1 = _cross(nodes_a, nodes_b, tA, tB)
-    if set(nodes_a) != set(nodes_b):
-        d2 = _cross(nodes_a, nodes_b, tB, tA)
-        all_d = np.concatenate([d1, d2], axis=1)
-    else:
-        all_d = d1
-
-    with np.errstate(all='ignore'):
-        return np.nanmin(all_d, axis=1)
+    sub = tracks[idxs]
+    xA = sub[:, 0, :, tA]; yA = sub[:, 1, :, tA]
+    xB = sub[:, 0, :, tB]; yB = sub[:, 1, :, tB]
+    return _region_min_dist_slab(xA, yA, xB, yB, nodes_a, nodes_b)
 
 
 # ---------------------------------------------------------------------------
@@ -925,9 +929,9 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
         # Zone times (1-second minimum visit filter when zone_label available)
         if zone_label is not None and t in zone_label and zone_label[t] is not None:
             zl = _apply_state_hold_filter(zone_label[t][sleap_idxs], fps)
-            center_t = float(np.sum(zl == 'Center')) / fps
-            perim_t  = float(np.sum(zl == 'Perimeter')) / fps
-            corner_t = float(np.sum(zl == 'Corner')) / fps
+            center_t = float(np.sum(zl == 'Open')) / fps
+            perim_t  = float(np.sum(np.isin(zl, ['W1','W2','W3','W4']))) / fps
+            corner_t = float(np.sum(np.isin(zl, ['C1','C2','C3','C4']))) / fps
             _add('Zone', 'Center Zone Time', tname, center_t, 's')
             _add('Zone', 'Perimeter Zone Time', tname, perim_t, 's')
             _add('Zone', 'Corner Zone Time', tname, corner_t, 's')
@@ -955,10 +959,27 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
     prox_thresh_px    = PROX_THRESHOLD_CM    * px_per_cm
     contact_thresh_px = CONTACT_THRESHOLD_CM * px_per_cm
 
+    # Extract indexed sub-array once; each pair loop re-uses it
+    tracks_sub = tracks[sleap_idxs]          # (n_valid, 2, n_nodes, n_tracks)
+    tailend_excl = _tailend_node_idxs(node_names)
+    n_nodes_total = tracks.shape[2]
+    active_nodes = [i for i in range(n_nodes_total) if i not in tailend_excl]
+
+    # Anatomical region definitions (same for every pair)
+    head_nodes = [i for i in [nose_idx, ear_l_idx, ear_r_idx] if i is not None]
+    body_nodes = [i for i in [body_idx, hip_l_idx, hip_r_idx] if i is not None]
+    tail_nodes  = [i for i in [tail_idx]                       if i is not None]
+
     for tA in range(n_tracks):
         for tB in range(tA + 1, n_tracks):
             pair_name = f'{track_names[tA]} & {track_names[tB]}'
             pfx = f't{tA}_t{tB}'
+
+            # Per-pair coordinate slabs — single extraction from tracks_sub
+            xA = tracks_sub[:, 0, :, tA]   # (n_valid, n_nodes)
+            yA = tracks_sub[:, 1, :, tA]
+            xB = tracks_sub[:, 0, :, tB]
+            yB = tracks_sub[:, 1, :, tB]
 
             # Body-body distance (from pair_arrays)
             inter_key = f'{pfx}/inter_animal_dist'
@@ -970,26 +991,21 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                 cm_B = _cm_pos(tracks, body_idx, tB)[sleap_idxs]
                 inter = np.hypot(cm_A[:, 0] - cm_B[:, 0], cm_A[:, 1] - cm_B[:, 1])
 
-            # Anatomical region definitions
-            head_nodes = [i for i in [nose_idx, ear_l_idx, ear_r_idx] if i is not None]
-            body_nodes = [i for i in [body_idx, hip_l_idx, hip_r_idx] if i is not None]
-            tail_nodes  = [i for i in [tail_idx]                       if i is not None]
-
             dist_pairs = {}
             if nose_idx is not None:
-                dist_pairs['Nose-Nose'] = _region_min_dist(tracks, sleap_idxs, tA, tB, [nose_idx], [nose_idx])
+                dist_pairs['Nose-Nose'] = _region_min_dist_slab(xA, yA, xB, yB, [nose_idx], [nose_idx])
             if head_nodes:
-                dist_pairs['Head-Head']  = _region_min_dist(tracks, sleap_idxs, tA, tB, head_nodes, head_nodes)
+                dist_pairs['Head-Head']  = _region_min_dist_slab(xA, yA, xB, yB, head_nodes, head_nodes)
                 if body_nodes:
-                    dist_pairs['Head-Body'] = _region_min_dist(tracks, sleap_idxs, tA, tB, head_nodes, body_nodes)
+                    dist_pairs['Head-Body'] = _region_min_dist_slab(xA, yA, xB, yB, head_nodes, body_nodes)
                 if tail_nodes:
-                    dist_pairs['Head-Tail'] = _region_min_dist(tracks, sleap_idxs, tA, tB, head_nodes, tail_nodes)
+                    dist_pairs['Head-Tail'] = _region_min_dist_slab(xA, yA, xB, yB, head_nodes, tail_nodes)
             if body_nodes:
-                dist_pairs['Body-Body']  = _region_min_dist(tracks, sleap_idxs, tA, tB, body_nodes, body_nodes)
+                dist_pairs['Body-Body']  = _region_min_dist_slab(xA, yA, xB, yB, body_nodes, body_nodes)
                 if tail_nodes:
-                    dist_pairs['Body-Tail'] = _region_min_dist(tracks, sleap_idxs, tA, tB, body_nodes, tail_nodes)
+                    dist_pairs['Body-Tail'] = _region_min_dist_slab(xA, yA, xB, yB, body_nodes, tail_nodes)
             if tail_nodes:
-                dist_pairs['Tail-Tail']  = _region_min_dist(tracks, sleap_idxs, tA, tB, tail_nodes, tail_nodes)
+                dist_pairs['Tail-Tail']  = _region_min_dist_slab(xA, yA, xB, yB, tail_nodes, tail_nodes)
 
             # Proximity and contact times (1-second minimum bout filter)
             for label, dist_arr in dist_pairs.items():
@@ -1008,8 +1024,12 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
 
             # General proximity/contact — minimum over all cross-animal node pairs
             # Exclude tailend nodes: only tailstart counts as a contact/proximity point
-            gen_dist, _ = _general_min_dist(tracks, sleap_idxs, tA, tB, node_names,
-                                            exclude_idxs=_tailend_node_idxs(node_names))
+            xa_all = xA[:, active_nodes]; ya_all = yA[:, active_nodes]
+            xb_all = xB[:, active_nodes]; yb_all = yB[:, active_nodes]
+            dx_all = xa_all[:, :, np.newaxis] - xb_all[:, np.newaxis, :]
+            dy_all = ya_all[:, :, np.newaxis] - yb_all[:, np.newaxis, :]
+            with np.errstate(all='ignore'):
+                gen_dist = np.nanmin(np.hypot(dx_all, dy_all).reshape(len(sleap_idxs), -1), axis=1)
             gen_prox_bin = np.isfinite(gen_dist) & (gen_dist <= prox_thresh_px)
             gen_prox_bin = _filter_short_active_bouts(gen_prox_bin, fps)
             _add('Proximity', 'General Proximity Time (2dp)', pair_name,

@@ -171,6 +171,7 @@ _PAIR_BEH_KEYS = frozenset({
 })
 _FEATURE_KEYS = frozenset({
     'main_animal_features', 'main_pair_features',
+    'main_key_metrics',
     'binned_animal_025', 'binned_animal_1s', 'binned_pair_025', 'binned_pair_1s',
     'graph_oncoplot', 'graph_oncoplot_clean',
     'graph_sync_oncoplot', 'graph_sync_oncoplot_clean',
@@ -300,6 +301,16 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, output_opts) ->
         prox_cumtime=prox_cumtime, cont_cumtime=cont_cumtime,
         hdg_diff=hdg_diff, prox_px=prox_px, cont_px=cont_px,
     ))
+
+    # Pre-compute key metrics once so export can use the cached result
+    if oo.get('main_key_metrics', True) and track_feat:
+        cache['key_metrics_df'] = build_key_metrics_df(
+            tracks, kin, single_beh, pair_beh,
+            track_feat, pair_feat, frame_map,
+            None, node_names, track_names, fps, px_per_cm,
+            zone_label=zone_label,
+        )
+
     return cache
 
 
@@ -652,13 +663,15 @@ class _ExportWorker(QObject):
                         )
                 # ---- Key Metrics separate file (*_key_metrics.xlsx) ----
                 if self._want("main_key_metrics"):
-                    key_metrics_df = build_key_metrics_df(
-                        tracks, kin, single_beh, pair_beh,
-                        track_arrays, pair_arrays, frame_map,
-                        summary, node_names, track_names,
-                        self._fps, px_per_cm,
-                        zone_label=zone_label,
-                    )
+                    key_metrics_df = self._cache.get('key_metrics_df')
+                    if key_metrics_df is None:
+                        key_metrics_df = build_key_metrics_df(
+                            tracks, kin, single_beh, pair_beh,
+                            track_arrays, pair_arrays, frame_map,
+                            summary, node_names, track_names,
+                            self._fps, px_per_cm,
+                            zone_label=zone_label,
+                        )
                     _p = Path(path)
                     km_path = str(_p.with_name(_p.stem + "_key_metrics" + _p.suffix))
                     self.status.emit("Writing key metrics file…")
