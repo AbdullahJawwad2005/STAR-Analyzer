@@ -2,7 +2,7 @@ import gc
 import threading
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QTimer, QDateTime, QThread, QObject
+from PySide6.QtCore import Qt, Signal, QTimer, QDateTime, QThread, QObject, QSettings
 import pandas as pd
 from PySide6.QtWidgets import (
     QWidget,
@@ -156,7 +156,47 @@ def _make_icon(kind: str) -> QIcon:
     return QIcon(px)
 
 
-def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> dict:
+# ---- Keys that require each computation tier --------------------------------
+_ZONE_KEYS = frozenset({
+    'main_zone_summary', 'graph_heatmaps', 'main_key_metrics',
+})
+_SINGLE_BEH_KEYS = frozenset({
+    'main_1st_order_behaviors', 'main_behavior_summary', 'main_key_metrics',
+    'binned_animal_025', 'binned_animal_1s', 'graph_cascade', 'rf_analysis',
+})
+_PAIR_BEH_KEYS = frozenset({
+    'main_2nd_order_behaviors', 'main_behavior_summary', 'main_engagement_indices',
+    'binned_pair_025', 'binned_pair_1s', 'binned_eng_indices_025',
+    'graph_sync_oncoplot', 'graph_sync_oncoplot_clean', 'rf_analysis',
+})
+_FEATURE_KEYS = frozenset({
+    'main_animal_features', 'main_pair_features',
+    'binned_animal_025', 'binned_animal_1s', 'binned_pair_025', 'binned_pair_1s',
+    'graph_oncoplot', 'graph_oncoplot_clean',
+    'graph_sync_oncoplot', 'graph_sync_oncoplot_clean',
+    'graph_dist_features', 'rf_analysis',
+})
+_PROXIMITY_KEYS = frozenset({
+    'main_key_metrics', 'graph_distance', 'graph_dist_features', 'rf_analysis',
+})
+
+
+def _resolve_compute_tiers(opts: dict, n_tracks: int) -> dict:
+    """Map fine-grained output keys to the 5 computation tiers needed."""
+    def has(keys):
+        return any(opts.get(k) for k in keys)
+    pair = n_tracks >= 2
+    return {
+        'kinematics': True,
+        'zones':      has(_ZONE_KEYS) or opts.get('live_zones', True),
+        'single_beh': has(_SINGLE_BEH_KEYS),
+        'pair_beh':   pair and has(_PAIR_BEH_KEYS),
+        'features':   has(_FEATURE_KEYS),
+        'proximity':  pair and (has(_PROXIMITY_KEYS) or opts.get('live_proximity', True)),
+    }
+
+
+def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, output_opts) -> dict:
     """Pure analysis computation — safe to call off the main thread."""
     data = processed_data
     tracks      = data["tracks"]
@@ -166,12 +206,7 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> d
 
     (rx0, ry0), (rx1, ry1), side = roi
 
-    po          = proc_opts or {}
-    do_single   = po.get('proc_single_beh', True)
-    do_pair     = po.get('proc_pair_beh', True)
-    do_features = po.get('proc_features', True)
-    do_zones    = po.get('proc_zones', True)
-    do_prox     = po.get('proc_proximity', True)
+    oo = output_opts or {}
 
     # Trim first 5 seconds (hand-placement buffer)
     n_frames = tracks.shape[0]
@@ -185,16 +220,17 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> d
                  if si >= analysis_start}
 
     n_tracks = tracks.shape[3]
+    tiers = _resolve_compute_tiers(oo, n_tracks)
 
     kin = compute_kinematics(tracks, fps, node_names=node_names)
 
     single_beh = (compute_single_animal(tracks, kin, node_names, fps, px_per_cm=px_per_cm)
-                  if do_single else {})
+                  if tiers['single_beh'] else {})
 
     pair_beh = (compute_pairwise(tracks, node_names, fps, dsr=None, kin=kin)
-                if (do_pair and n_tracks >= 2) else {})
+                if tiers['pair_beh'] else {})
 
-    if do_features:
+    if tiers['features']:
         track_feat, pair_feat = precompute_feature_arrays(
             tracks, kin, node_names, fps, roi=(rx0, ry0, rx1, ry1))
     else:
@@ -210,7 +246,7 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> d
         frame_map=frame_map, body_idx=body_idx,
         inv_ppcm=1.0 / max(px_per_cm, 1e-9),
         px_per_cm=px_per_cm,
-        proc_opts=po,
+        output_opts=oo,
         analysis_start_vidframe=analysis_start_vidframe,
     )
 
@@ -227,25 +263,20 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, proc_opts) -> d
                               .rolling(ROLL_W, center=True, min_periods=1)
                               .mean().to_numpy())
 
-    if do_zones:
+    if tiers['zones']:
         strip_px = strip_cm * px_per_cm
         zone_label = {}
         for t in range(n_tracks):
             ni = body_idx if body_idx is not None else 0
             x = tracks[:, 0, ni, t]
             y = tracks[:, 1, ni, t]
-            near_h = np.minimum(x - rx0, rx1 - x) < strip_px
-            near_v = np.minimum(y - ry0, ry1 - y) < strip_px
-            lbl = np.full(n_frames, 'Center', dtype=object)
-            lbl[near_h ^ near_v] = 'Perimeter'
-            lbl[near_h & near_v] = 'Corner'
-            zone_label[t] = lbl
+            zone_label[t] = _classify_zone_vec(x, y, rx0, ry0, rx1, ry1, strip_px)
     else:
         zone_label = {}
 
     prox_px = PROX_THRESHOLD_CM * px_per_cm
     cont_px = CONTACT_THRESHOLD_CM * px_per_cm
-    if n_tracks >= 2 and len(sleap_idxs_arr) > 0:
+    if tiers['proximity'] and len(sleap_idxs_arr) > 0:
         tailend_excl = _tailend_node_idxs(node_names)
         gen_dist_tracked, gen_closest_tracked = _general_min_dist(
             tracks, sleap_idxs_arr, 0, 1, node_names, exclude_idxs=tailend_excl)
@@ -276,21 +307,21 @@ class _AnalysisWorker(QObject):
     done  = Signal(object)   # completed cache dict
     error = Signal(str)
 
-    def __init__(self, processed_data, fps, roi, px_per_cm, strip_cm, proc_opts):
+    def __init__(self, processed_data, fps, roi, px_per_cm, strip_cm, output_opts):
         super().__init__()
         self._processed_data = processed_data
         self._fps            = fps
         self._roi            = roi
         self._px_per_cm      = px_per_cm
         self._strip_cm       = strip_cm
-        self._proc_opts      = proc_opts or {}
+        self._output_opts    = output_opts or {}
 
     def run(self):
         try:
             self.done.emit(_run_analysis(
                 self._processed_data, self._fps,
                 self._roi, self._px_per_cm, self._strip_cm,
-                self._proc_opts,
+                self._output_opts,
             ))
         except Exception:
             import traceback
@@ -388,10 +419,10 @@ class _ExportWorker(QObject):
             track_arrays = self._cache.get('track_feat', {})
             pair_arrays  = self._cache.get('pair_feat', {})
             zone_label   = self._cache.get('zone_label')
-            po           = self._cache.get('proc_opts', {})
+            oo           = self._cache.get('output_opts', {})
 
             # ---- 2nd-order compound social behaviors (export-only) ----
-            if pair_beh and po.get('proc_pair_beh', True):
+            if pair_beh and oo.get('main_2nd_order_behaviors', False):
                 self.status.emit("Detecting 2nd-order behaviors…")
                 second_order = compute_second_order(
                     tracks, kin, node_names, self._fps, single_beh, pair_beh)
@@ -403,7 +434,7 @@ class _ExportWorker(QObject):
                 tracks=tracks, kin=kin, frame_map=frame_map, node_names=node_names)
 
             # ---- Feature DataFrames (reuse precomputed arrays from cache) ----
-            if track_arrays and po.get('proc_features', True):
+            if track_arrays and oo.get('main_animal_features', False):
                 self.status.emit("Building feature dataframes…")
                 animal_feat_df, pair_feat_df = build_feature_dataframes(
                     tracks, kin, node_names, track_names, self._fps,
@@ -730,81 +761,279 @@ class _ExportWorker(QObject):
             self.error.emit(traceback.format_exc())
 
 
-class ProcessingOptionsDialog(QDialog):
-    """Choose which analysis modules to run before processing."""
+# Keys that require ≥ 2 tracks (disabled when n_tracks < 2)
+_PAIR_ONLY_KEYS = frozenset({
+    "main_2nd_order_behaviors", "main_engagement_indices", "main_pair_features",
+    "binned_pair_025", "binned_eng_indices_025", "binned_pair_1s",
+    "graph_distance", "graph_sync_oncoplot", "graph_sync_oncoplot_clean",
+    "graph_dist_features", "rf_analysis", "rf_analysis_plots",
+})
 
-    def __init__(self, n_tracks=1, default_opts=None, parent=None):
+
+class ProcessingOutputDialog(QDialog):
+    """Choose which outputs to compute + what the Live MetricsPanel shows.
+
+    Selections persist across sessions via QSettings("AUG", "STAR").
+    The dialog mirrors the ExportOptionsDialog structure so that what you
+    tick in processing is exactly what gets computed and offered for export.
+    """
+
+    _MAIN_SHEETS = [
+        ("main_tracking_data",       "Tracking Data"),
+        ("main_zone_summary",        "Zone Summary"),
+        ("main_session_info",        "Session Info"),
+        ("main_1st_order_behaviors", "1st Order Behaviors"),
+        ("main_2nd_order_behaviors", "2nd Order Behaviors  [pair]"),
+        ("main_behavior_summary",    "Behavior Summary"),
+        ("main_engagement_indices",  "Engagement Indices  [pair]"),
+        ("main_animal_features",     "Animal Features"),
+        ("main_pair_features",       "Pair Features  [pair]"),
+        ("main_key_metrics",         "Key Metrics"),
+    ]
+    _BINNED_SHEETS = [
+        ("binned_animal_025",      "Animal 0.25s"),
+        ("binned_pair_025",        "Pair 0.25s  [pair]"),
+        ("binned_eng_indices_025", "Engagement Indices 0.25s  [pair]"),
+        ("binned_animal_1s",       "Animal 1s"),
+        ("binned_pair_1s",         "Pair 1s  [pair]"),
+    ]
+    _GRAPH_PDFS = [
+        ("graph_heatmaps",             "Heatmaps"),
+        ("graph_cascade",              "Cascade (speed / accel / jerk)"),
+        ("graph_distance",             "Distance  [pair]"),
+        ("graph_oncoplot",             "Feature Oncoplot"),
+        ("graph_sync_oncoplot",        "Synchrony Oncoplot  [pair]"),
+        ("graph_oncoplot_clean",       "Feature Oncoplot (clean)"),
+        ("graph_sync_oncoplot_clean",  "Synchrony Oncoplot (clean)  [pair]"),
+        ("graph_dist_features",        "Feature vs Distance  [pair]"),
+    ]
+    _RF_ANALYSIS = [
+        ("rf_analysis",       "Random Forest Bout Analysis  [pair]"),
+        ("rf_analysis_plots", "RF Analysis Plots (PDF)  [pair]"),
+    ]
+
+    def __init__(self, n_tracks=1, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Processing Options")
+        self._updating = False
+        self.setWindowTitle("Select Outputs to Compute")
         self.setWindowIcon(_make_icon("export"))
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(430)
 
-        po = default_opts or {}
+        settings = QSettings("AUG", "STAR")
         layout = QVBoxLayout(self)
-        self._checks: dict[str, QCheckBox] = {}
+        layout.setSpacing(6)
 
-        # Always-on group
-        grp_core = QGroupBox("Core (always computed)")
-        vb = QVBoxLayout(grp_core)
-        cb_kin = QCheckBox("Kinematics  (speed / accel / jerk / heading)")
-        cb_kin.setChecked(True); cb_kin.setEnabled(False)
-        vb.addWidget(cb_kin)
-        layout.addWidget(grp_core)
+        # ---- Header ----
+        hdr = QLabel("Only selected items will be computed and available for export.")
+        hdr.setStyleSheet("color:#888; font-size:11px;")
+        hdr.setWordWrap(True)
+        layout.addWidget(hdr)
 
-        # Single-animal group
-        grp_single = QGroupBox("Single-Animal Analysis")
-        vb2 = QVBoxLayout(grp_single)
-        self._add_check(vb2, 'proc_single_beh',
-                        "Single-animal behaviors  (stationary, locomotion, turning)",
-                        po.get('proc_single_beh', True))
-        self._add_check(vb2, 'proc_features',
-                        "Feature arrays  (shape, path efficiency, entropy, curvature)",
-                        po.get('proc_features', True))
-        self._add_check(vb2, 'proc_zones',
-                        "Zone analysis  (center / perimeter / corner)",
-                        po.get('proc_zones', True))
-        layout.addWidget(grp_single)
+        # ---- Live Playback View section ----
+        live_frame = QFrame()
+        live_frame.setStyleSheet(
+            "QFrame { background:#1e2a30; border:1px solid #2a4050;"
+            " border-radius:4px; padding:4px; }"
+        )
+        live_vbox = QVBoxLayout(live_frame)
+        live_vbox.setContentsMargins(8, 6, 8, 6)
+        live_vbox.setSpacing(4)
 
-        # Pair group (disabled if single track)
-        grp_pair = QGroupBox("Pair / Social Analysis")
-        vb3 = QVBoxLayout(grp_pair)
-        self._add_check(vb3, 'proc_pair_beh',
-                        "Pair behaviors  (proximity subtypes, approach, following)",
-                        po.get('proc_pair_beh', True))
-        self._add_check(vb3, 'proc_proximity',
-                        "Proximity tracking  (inter-animal distance, bouts)",
-                        po.get('proc_proximity', True))
+        live_hdr = QLabel("LIVE PLAYBACK VIEW")
+        live_hdr.setStyleSheet(
+            "color:#4a9ab0; font-weight:bold; font-size:11px; background:transparent; border:none;")
+        live_vbox.addWidget(live_hdr)
+
+        tooltip_live = "Controls what the metrics panel shows during video playback.\nDoes not affect which outputs are exported."
+        self._cb_live_zones = QCheckBox("Zone display (C1-C4 / W1-W4 / Open)")
+        self._cb_live_zones.setStyleSheet("QCheckBox { background:transparent; border:none; }")
+        self._cb_live_zones.setChecked(settings.value("proc/live_zones", True, type=bool))
+        self._cb_live_zones.setToolTip(tooltip_live)
+        live_vbox.addWidget(self._cb_live_zones)
+
+        self._cb_live_prox = QCheckBox("Distance & bout status (2+ animals)")
+        self._cb_live_prox.setStyleSheet("QCheckBox { background:transparent; border:none; }")
+        self._cb_live_prox.setChecked(settings.value("proc/live_proximity", True, type=bool))
+        self._cb_live_prox.setToolTip(tooltip_live)
         if n_tracks < 2:
-            grp_pair.setEnabled(False)
-            grp_pair.setToolTip("Requires \u2265 2 tracked animals")
-        layout.addWidget(grp_pair)
+            self._cb_live_prox.setEnabled(False)
+            self._cb_live_prox.setToolTip("Requires \u2265 2 tracked animals")
+        live_vbox.addWidget(self._cb_live_prox)
 
+        layout.addWidget(live_frame)
+
+        # ---- Separator ----
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#333;")
+        layout.addWidget(sep)
+
+        # ---- Master checkbox ----
+        self._master = QCheckBox("Select All Outputs")
+        self._master.setChecked(True)
+        self._master.setTristate(True)
+        self._master.stateChanged.connect(self._on_master_changed)
+        layout.addWidget(self._master)
+
+        # ---- Scrollable output groups ----
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._checks: dict[str, QCheckBox] = {}
+        self._group_all: list[QCheckBox] = []
+
+        self._build_group(scroll_layout, "Main Excel Workbook", self._MAIN_SHEETS)
+        self._build_group(scroll_layout, "Binned Excel Workbook", self._BINNED_SHEETS)
+        grp_graph = self._build_group(scroll_layout, "Graph PDFs", self._GRAPH_PDFS)
+        rf_grp    = self._build_group(scroll_layout, "Analysis (RF)", self._RF_ANALYSIS)
+
+        if not _GRAPHS_AVAILABLE:
+            grp_graph.setEnabled(False)
+            grp_graph.setToolTip("matplotlib not available — graphs disabled")
+        if not _RF_AVAILABLE:
+            rf_grp.setEnabled(False)
+            rf_grp.setToolTip("scikit-learn not available — RF analysis disabled")
+
+        # Disable pair-only items when n_tracks < 2
+        if n_tracks < 2:
+            for key in _PAIR_ONLY_KEYS:
+                if key in self._checks:
+                    self._checks[key].setEnabled(False)
+                    self._checks[key].setToolTip("Requires \u2265 2 tracked animals")
+
+        # Restore saved settings (only for enabled checkboxes)
+        for key, cb in self._checks.items():
+            if cb.isEnabled():
+                cb.setChecked(settings.value(f"proc/{key}", True, type=bool))
+
+        # Sync group-all and master after restoring
+        for ga, items in zip(self._group_all, [
+                self._MAIN_SHEETS, self._BINNED_SHEETS, self._GRAPH_PDFS, self._RF_ANALYSIS]):
+            self._sync_group(ga, items)
+        self._sync_master()
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll, 1)
+
+        # ---- Buttons ----
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.button(QDialogButtonBox.Ok).setText("Analyze")
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-    def _add_check(self, layout, key, label, checked):
-        cb = QCheckBox(label); cb.setChecked(checked)
-        self._checks[key] = cb; layout.addWidget(cb)
+    # ---- Group builder ----
+    def _build_group(self, parent_layout, title, items):
+        grp = QGroupBox(title)
+        vbox = QVBoxLayout(grp)
+
+        grp_all = QCheckBox("All")
+        grp_all.setChecked(True)
+        grp_all.setTristate(True)
+        grp_all.stateChanged.connect(
+            lambda _st, g=grp_all, it=items: self._on_group_changed(g, it))
+        self._group_all.append(grp_all)
+        vbox.addWidget(grp_all)
+
+        for key, label in items:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.stateChanged.connect(
+                lambda _st, g=grp_all, it=items: self._sync_group(g, it))
+            self._checks[key] = cb
+            vbox.addWidget(cb)
+
+        parent_layout.addWidget(grp)
+        return grp
+
+    # ---- Sync helpers ----
+    def _on_master_changed(self, state):
+        if self._updating:
+            return
+        if state == Qt.PartiallyChecked:
+            return
+        self._updating = True
+        checked = (state == Qt.Checked)
+        for cb in self._checks.values():
+            if cb.isEnabled():
+                cb.setChecked(checked)
+        for ga in self._group_all:
+            if ga.isEnabled():
+                ga.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._updating = False
+
+    def _on_group_changed(self, grp_all, items):
+        if self._updating:
+            return
+        state = grp_all.checkState()
+        if state == Qt.PartiallyChecked:
+            return
+        self._updating = True
+        checked = (state == Qt.Checked)
+        for key, _ in items:
+            if self._checks[key].isEnabled():
+                self._checks[key].setChecked(checked)
+        self._updating = False
+        self._sync_master()
+
+    def _sync_group(self, grp_all, items):
+        if self._updating:
+            return
+        self._updating = True
+        states = [self._checks[k].isChecked() for k, _ in items if self._checks[k].isEnabled()]
+        if not states:
+            grp_all.setCheckState(Qt.Unchecked)
+        elif all(states):
+            grp_all.setCheckState(Qt.Checked)
+        elif any(states):
+            grp_all.setCheckState(Qt.PartiallyChecked)
+        else:
+            grp_all.setCheckState(Qt.Unchecked)
+        self._updating = False
+        self._sync_master()
+
+    def _sync_master(self):
+        enabled = [cb for cb in self._checks.values() if cb.isEnabled()]
+        all_checked = all(cb.isChecked() for cb in enabled)
+        any_checked = any(cb.isChecked() for cb in enabled)
+        self._updating = True
+        if all_checked:
+            self._master.setCheckState(Qt.Checked)
+        elif any_checked:
+            self._master.setCheckState(Qt.PartiallyChecked)
+        else:
+            self._master.setCheckState(Qt.Unchecked)
+        self._updating = False
 
     def _accept(self):
-        if not any(cb.isChecked() for cb in self._checks.values()):
+        settings = QSettings("AUG", "STAR")
+        settings.setValue("proc/live_zones",    self._cb_live_zones.isChecked())
+        settings.setValue("proc/live_proximity", self._cb_live_prox.isChecked())
+        for key, cb in self._checks.items():
+            if cb.isEnabled():
+                settings.setValue(f"proc/{key}", cb.isChecked())
+        if not any(cb.isChecked() for cb in self._checks.values() if cb.isEnabled()):
             QMessageBox.warning(self, "Nothing selected",
-                                "Select at least one analysis module.")
+                                "Select at least one output to compute.")
             return
         self.accept()
 
     def options(self) -> dict:
-        return {'proc_kinematics': True,
-                **{k: cb.isChecked() for k, cb in self._checks.items()}}
+        result = {k: cb.isChecked() and cb.isEnabled()
+                  for k, cb in self._checks.items()}
+        result['live_zones']    = self._cb_live_zones.isChecked()
+        result['live_proximity'] = self._cb_live_prox.isChecked()
+        return result
 
 
 class ExportOptionsDialog(QDialog):
-    """Modal dialog letting the user pick which export outputs to generate."""
+    """Show only the outputs that were requested in processing; let user deselect any."""
 
-    # (key, label) tuples for each group
+    # Class-level lists referenced by _ExportWorker (must stay here)
     _MAIN_SHEETS = [
         ("main_tracking_data",       "Tracking Data"),
         ("main_zone_summary",        "Zone Summary"),
@@ -825,9 +1054,9 @@ class ExportOptionsDialog(QDialog):
         ("binned_pair_1s",         "Pair 1s"),
     ]
     _GRAPH_PDFS = [
-        ("graph_heatmaps",       "Heatmaps"),
-        ("graph_cascade",        "Cascade (speed / accel / jerk)"),
-        ("graph_distance",       "Distance"),
+        ("graph_heatmaps",             "Heatmaps"),
+        ("graph_cascade",              "Cascade (speed / accel / jerk)"),
+        ("graph_distance",             "Distance"),
         ("graph_oncoplot",             "Feature Oncoplot"),
         ("graph_sync_oncoplot",        "Synchrony Oncoplot"),
         ("graph_oncoplot_clean",       "Feature Oncoplot (clean)"),
@@ -840,38 +1069,41 @@ class ExportOptionsDialog(QDialog):
     ]
 
     _GRAPH_SUFFIXES = {
-        "graph_heatmaps":           "_graphs_heatmaps.pdf",
-        "graph_cascade":            "_graphs_cascade.pdf",
-        "graph_distance":           "_graphs_distance.pdf",
-        "graph_oncoplot":           "_graphs_oncoplot.pdf",
-        "graph_sync_oncoplot":      "_graphs_sync_oncoplot.pdf",
-        "graph_oncoplot_clean":     "_graphs_oncoplot_clean.pdf",
-        "graph_sync_oncoplot_clean":"_graphs_sync_oncoplot_clean.pdf",
-        "graph_dist_features":      "_graphs_dist_features.pdf",
+        "graph_heatmaps":            "_graphs_heatmaps.pdf",
+        "graph_cascade":             "_graphs_cascade.pdf",
+        "graph_distance":            "_graphs_distance.pdf",
+        "graph_oncoplot":            "_graphs_oncoplot.pdf",
+        "graph_sync_oncoplot":       "_graphs_sync_oncoplot.pdf",
+        "graph_oncoplot_clean":      "_graphs_oncoplot_clean.pdf",
+        "graph_sync_oncoplot_clean": "_graphs_sync_oncoplot_clean.pdf",
+        "graph_dist_features":       "_graphs_dist_features.pdf",
     }
     _RF_SUFFIXES = {
         "rf_analysis":       ["_rf_bouts.csv", "_rf_report.csv", "_rf_importance.csv"],
         "rf_analysis_plots": ["_rf_analysis.pdf"],
     }
 
-    def __init__(self, graphs_available=True, default_dir="", default_name="export",
-                 proc_opts=None, parent=None):
+    def __init__(self, output_opts=None, default_dir="", default_name="export", parent=None):
         super().__init__(parent)
-        self._updating = False   # guard against recursive signal loops — must be set before any widget creation
+        self._updating = False
         self.setWindowTitle("Export Options")
         self.setWindowIcon(_make_icon("export"))
         self.setMinimumWidth(420)
 
+        # output_opts: True = was computed & requested → show pre-checked
+        #              False/missing = was not computed → skip entirely
+        oo = output_opts or {}
+
         layout = QVBoxLayout(self)
 
-        # ---- Master checkbox (above scroll area) ----
+        # ---- Master checkbox ----
         self._master = QCheckBox("Select All Outputs")
         self._master.setChecked(True)
         self._master.setTristate(True)
         self._master.stateChanged.connect(self._on_master_changed)
         layout.addWidget(self._master)
 
-        # ---- Scrollable area for checkbox groups ----
+        # ---- Scrollable area ----
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -882,45 +1114,10 @@ class ExportOptionsDialog(QDialog):
         self._checks: dict[str, QCheckBox] = {}
         self._group_all: list[QCheckBox] = []
 
-        self._build_group(scroll_layout, "Main Excel Workbook", self._MAIN_SHEETS)
-        self._build_group(scroll_layout, "Binned Excel Workbook", self._BINNED_SHEETS)
-        grp = self._build_group(scroll_layout, "Graph PDFs", self._GRAPH_PDFS)
-        if not graphs_available:
-            grp.setEnabled(False)
-            grp.setToolTip("matplotlib not available — graphs disabled")
-
-        rf_grp = self._build_group(scroll_layout, "Analysis", self._RF_ANALYSIS)
-        if not _RF_AVAILABLE:
-            rf_grp.setEnabled(False)
-            rf_grp.setToolTip("scikit-learn not available — RF analysis disabled")
-
-        # ---- Gate checkboxes based on what was processed ----
-        _PROC_GATES = {
-            "main_1st_order_behaviors":  "proc_single_beh",
-            "main_2nd_order_behaviors":  "proc_pair_beh",
-            "main_behavior_summary":     "proc_single_beh",
-            "main_engagement_indices":   "proc_pair_beh",
-            "main_animal_features":      "proc_features",
-            "main_pair_features":        "proc_features",
-            "main_zone_summary":         "proc_zones",
-            "binned_animal_025":         "proc_features",
-            "binned_pair_025":           "proc_features",
-            "binned_eng_indices_025":    "proc_pair_beh",
-            "binned_animal_1s":          "proc_features",
-            "binned_pair_1s":            "proc_features",
-            "graph_heatmaps":            "proc_zones",
-            "graph_distance":            "proc_proximity",
-            "graph_oncoplot":            "proc_features",
-            "graph_sync_oncoplot":       "proc_pair_beh",
-            "graph_oncoplot_clean":      "proc_features",
-            "graph_sync_oncoplot_clean": "proc_pair_beh",
-            "graph_dist_features":       "proc_features",
-        }
-        if proc_opts:
-            for key, proc_key in _PROC_GATES.items():
-                if key in self._checks and not proc_opts.get(proc_key, True):
-                    self._checks[key].setChecked(False)
-                    self._checks[key].setEnabled(False)
+        self._build_group(scroll_layout, "Main Excel Workbook", self._MAIN_SHEETS, oo)
+        self._build_group(scroll_layout, "Binned Excel Workbook", self._BINNED_SHEETS, oo)
+        self._build_group(scroll_layout, "Graph PDFs", self._GRAPH_PDFS, oo)
+        self._build_group(scroll_layout, "Analysis", self._RF_ANALYSIS, oo)
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -970,28 +1167,33 @@ class ExportOptionsDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        # Connect all checkboxes + name edit to preview updater
         for cb in self._checks.values():
             cb.stateChanged.connect(self._update_preview)
         self._name_edit.textChanged.connect(self._update_preview)
         self._update_preview()
 
-    # ---- Group builder ----
-    def _build_group(self, parent_layout, title, items):
+    # ---- Group builder — only adds items computed in processing ----
+    def _build_group(self, parent_layout, title, items, output_opts):
+        computed = [(k, l) for k, l in items if output_opts.get(k, False)]
+        if not computed:
+            return  # nothing was computed for this group — skip entirely
+
         grp = QGroupBox(title)
         vbox = QVBoxLayout(grp)
 
         grp_all = QCheckBox("All")
         grp_all.setChecked(True)
         grp_all.setTristate(True)
-        grp_all.stateChanged.connect(lambda _st, g=grp_all, it=items: self._on_group_changed(g, it))
+        grp_all.stateChanged.connect(
+            lambda _st, g=grp_all, it=computed: self._on_group_changed(g, it))
         self._group_all.append(grp_all)
         vbox.addWidget(grp_all)
 
-        for key, label in items:
+        for key, label in computed:
             cb = QCheckBox(label)
             cb.setChecked(True)
-            cb.stateChanged.connect(lambda _st, g=grp_all, it=items: self._sync_group(g, it))
+            cb.stateChanged.connect(
+                lambda _st, g=grp_all, it=computed: self._sync_group(g, it))
             self._checks[key] = cb
             vbox.addWidget(cb)
 
@@ -1007,11 +1209,9 @@ class ExportOptionsDialog(QDialog):
         self._updating = True
         checked = (state == Qt.Checked)
         for cb in self._checks.values():
-            if cb.isEnabled():
-                cb.setChecked(checked)
+            cb.setChecked(checked)
         for ga in self._group_all:
-            if ga.isEnabled():
-                ga.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            ga.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self._updating = False
 
     def _on_group_changed(self, grp_all, items):
@@ -1023,7 +1223,7 @@ class ExportOptionsDialog(QDialog):
         self._updating = True
         checked = (state == Qt.Checked)
         for key, _ in items:
-            if self._checks[key].isEnabled():
+            if key in self._checks:
                 self._checks[key].setChecked(checked)
         self._updating = False
         self._sync_master()
@@ -1032,8 +1232,10 @@ class ExportOptionsDialog(QDialog):
         if self._updating:
             return
         self._updating = True
-        states = [self._checks[k].isChecked() for k, _ in items]
-        if all(states):
+        states = [self._checks[k].isChecked() for k, _ in items if k in self._checks]
+        if not states:
+            grp_all.setCheckState(Qt.Unchecked)
+        elif all(states):
             grp_all.setCheckState(Qt.Checked)
         elif any(states):
             grp_all.setCheckState(Qt.PartiallyChecked)
@@ -1043,8 +1245,8 @@ class ExportOptionsDialog(QDialog):
         self._sync_master()
 
     def _sync_master(self):
-        all_checked = all(cb.isChecked() for cb in self._checks.values() if cb.isEnabled())
-        any_checked = any(cb.isChecked() for cb in self._checks.values() if cb.isEnabled())
+        all_checked = all(cb.isChecked() for cb in self._checks.values())
+        any_checked = any(cb.isChecked() for cb in self._checks.values())
         self._updating = True
         if all_checked:
             self._master.setCheckState(Qt.Checked)
@@ -1067,7 +1269,7 @@ class ExportOptionsDialog(QDialog):
         if not name:
             return
         opts = self.options()
-        any_main = any(opts.get(k, False) for k, _ in self._MAIN_SHEETS)
+        any_main   = any(opts.get(k, False) for k, _ in self._MAIN_SHEETS)
         any_binned = any(opts.get(k, False) for k, _ in self._BINNED_SHEETS)
         if any_main:
             self._preview.addItem(f"{name}.xlsx")
@@ -1084,12 +1286,12 @@ class ExportOptionsDialog(QDialog):
     def export_path(self) -> str:
         """Return full base path: folder/basename (no extension)."""
         folder = self._folder_edit.text().strip()
-        name = self._name_edit.text().strip()
+        name   = self._name_edit.text().strip()
         return str(Path(folder) / name)
 
     # ---- Accept / reject ----
     def _accept(self):
-        if not any(cb.isChecked() for cb in self._checks.values() if cb.isEnabled()):
+        if not any(cb.isChecked() for cb in self._checks.values()):
             QMessageBox.warning(self, "No output selected",
                                 "Select at least one output to export.")
             return
@@ -1106,7 +1308,7 @@ class ExportOptionsDialog(QDialog):
         self.accept()
 
     def options(self) -> dict:
-        """Return {key: bool} for every export option."""
+        """Return {key: bool} for every shown export option."""
         return {k: cb.isChecked() for k, cb in self._checks.items()}
 
 
@@ -1734,16 +1936,18 @@ class RunPopUp(QWidget):
         lbl_post.setAlignment(Qt.AlignCenter)
         self.view_b = ROIView()
         self.view_b.setMinimumSize(360, 200)
-        self._metrics_panel = _MetricsPanel(self)
         right_col = QVBoxLayout()
         right_col.setSpacing(3)
         right_col.addWidget(lbl_post)
         right_col.addWidget(self.view_b, stretch=1)
-        right_col.addWidget(self._metrics_panel, stretch=0)
 
         video_row.addLayout(left_col, stretch=1)
         video_row.addLayout(right_col, stretch=1)
         main.addLayout(video_row, stretch=1)
+
+        # Metrics panel spans full width below both videos
+        self._metrics_panel = _MetricsPanel(self)
+        main.addWidget(self._metrics_panel)
 
         # Progress row
         progress_row = QHBoxLayout()
@@ -2051,7 +2255,7 @@ class RunPopUp(QWidget):
     def _on_arena_cm_changed(self, _):
         self._recompute_zones()
         if self._analysis_cache is not None:
-            self._precompute_analysis(proc_opts=getattr(self, '_proc_opts', None))
+            self._precompute_analysis(output_opts=getattr(self, '_output_opts', None))
         self._show_frame(self._index)
 
     # ---- Process -------------------------------------------------------
@@ -2068,14 +2272,10 @@ class RunPopUp(QWidget):
 
         # Show processing options dialog before starting
         n_tracks = self._sleap_data["tracks"].shape[3]
-        proc_dlg = ProcessingOptionsDialog(
-            n_tracks=n_tracks,
-            default_opts=getattr(self, '_proc_opts', None),
-            parent=self,
-        )
+        proc_dlg = ProcessingOutputDialog(n_tracks=n_tracks, parent=self)
         if proc_dlg.exec() != QDialog.Accepted:
             return
-        self._proc_opts = proc_dlg.options()
+        self._output_opts = proc_dlg.options()
 
         self._btn_process.setEnabled(False)
         self._btn_process.setText("Processing…")
@@ -2106,7 +2306,7 @@ class RunPopUp(QWidget):
         # Don't re-enable btn_process yet — analysis worker will do it
         self._progress_bar.setVisible(True)   # keep visible for analysis phase
         self._btn_process.setText("Analyzing…")
-        self._precompute_analysis(proc_opts=getattr(self, '_proc_opts', None))
+        self._precompute_analysis(output_opts=getattr(self, '_output_opts', None))
         # _show_frame called from _on_analysis_done
 
     def _on_process_error(self, msg):
@@ -2117,7 +2317,7 @@ class RunPopUp(QWidget):
 
     # ---- Analysis precompute & overlay ---------------------------------
 
-    def _precompute_analysis(self, proc_opts=None):
+    def _precompute_analysis(self, output_opts=None):
         """Start background analysis worker. UI remains responsive."""
         data = self._processed_sleap_data
         if data is None:
@@ -2149,7 +2349,7 @@ class RunPopUp(QWidget):
         self._btn_process.setText("Analyzing…")
 
         self._analysis_worker = _AnalysisWorker(
-            data, self._fps, roi, px_per_cm, strip_cm, proc_opts or {}
+            data, self._fps, roi, px_per_cm, strip_cm, output_opts or {}
         )
         self._analysis_thread = QThread()
         self._analysis_worker.moveToThread(self._analysis_thread)
@@ -2226,11 +2426,10 @@ class RunPopUp(QWidget):
                 "Another export is already running. Please wait for it to finish.")
             return
 
-        # Unified export dialog (checkboxes + save location)
+        # Unified export dialog — only shows items computed in processing
         vp = Path(self._video_path)
         dlg = ExportOptionsDialog(
-            graphs_available=_GRAPHS_AVAILABLE,
-            proc_opts=self._analysis_cache.get('proc_opts') if self._analysis_cache else None,
+            output_opts=self._analysis_cache.get('output_opts') if self._analysis_cache else None,
             default_dir=str(vp.parent),
             default_name=vp.stem,
             parent=self,
