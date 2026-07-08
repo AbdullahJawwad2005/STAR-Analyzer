@@ -61,12 +61,44 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        # GUI toolkits we don't use
         'tkinter',
         '_tkinter',
+        # Build-time only
         'PIL',
         'Pillow',
+        # Massive ML frameworks not used by the app
+        'torch',
+        'torchvision',
+        'torchaudio',
+        'tensorflow',
+        'tensorflow_core',
+        'keras',
+        'transformers',
+        'huggingface_hub',
+        'diffusers',
+        'accelerate',
+        # Data science extras not used
+        'sympy',
+        'symengine',
+        'seaborn',
+        'statsmodels',
+        # Networking / async (not used)
+        'aiohttp',
+        'aiofiles',
+        'asyncio',
+        'asyncpg',
+        'httpx',
+        'httpcore',
+        'starlette',
+        'fastapi',
+        'uvicorn',
+        'websockets',
+        'grpc',
+        # Jupyter / IPython
         'IPython',
         'ipykernel',
+        'ipywidgets',
         'notebook',
         'jupyter',
         'jupyter_client',
@@ -74,13 +106,16 @@ a = Analysis(
         'nbformat',
         'nbconvert',
         'traitlets',
+        # Build / packaging
         'setuptools',
         'pkg_resources',
         'distutils',
+        # Test / docs
         'unittest',
         'doctest',
         'pydoc',
         'test',
+        # Unused stdlib
         'xmlrpc',
         'curses',
         'lib2to3',
@@ -93,7 +128,10 @@ a = Analysis(
         'smtplib',
         'poplib',
         'telnetlib',
-        'socket',
+        # DB drivers not needed
+        'psycopg2',
+        'MySQLdb',
+        'pysqlite2',
     ],
     noarchive=False,
     optimize=1,
