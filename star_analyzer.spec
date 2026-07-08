@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for STAR Analyzer.
+PyInstaller spec file for MOSIAC.
 
 Build with:
     pyinstaller star_analyzer.spec
 
-Produces:  dist/STAR Analyzer/STAR Analyzer.exe  (--onedir mode)
+Produces:  dist/MOSIAC/MOSIAC.exe  (--onedir mode)
 """
 
 import os
@@ -13,9 +13,9 @@ import os
 block_cipher = None
 
 # Check for icon file
-icon_file = 'star_analyzer.ico'
+icon_file = 'mosiac.ico'
 if not os.path.exists(icon_file):
-    icon_file = None
+    icon_file = 'star_analyzer.ico' if os.path.exists('star_analyzer.ico') else None
 
 a = Analysis(
     ['main.py'],
@@ -111,7 +111,6 @@ a = Analysis(
         'pkg_resources',
         'distutils',
         # Test / docs
-        'unittest',
         'doctest',
         'pydoc',
         'test',
@@ -119,15 +118,6 @@ a = Analysis(
         'xmlrpc',
         'curses',
         'lib2to3',
-        'email',
-        'html',
-        'http',
-        'urllib',
-        'ftplib',
-        'imaplib',
-        'smtplib',
-        'poplib',
-        'telnetlib',
         # DB drivers not needed
         'psycopg2',
         'MySQLdb',
@@ -144,7 +134,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='STAR Analyzer',
+    name='MOSIAC',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -165,5 +155,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='STAR Analyzer',
+    name='MOSIAC',
 )

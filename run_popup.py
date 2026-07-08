@@ -786,7 +786,7 @@ _PAIR_ONLY_KEYS = frozenset({
 class ProcessingOutputDialog(QDialog):
     """Choose which outputs to compute + what the Live MetricsPanel shows.
 
-    Selections persist across sessions via QSettings("AUG", "STAR").
+    Selections persist across sessions via QSettings("WangLabs", "MOSIAC").
     The dialog mirrors the ExportOptionsDialog structure so that what you
     tick in processing is exactly what gets computed and offered for export.
     """
@@ -828,11 +828,11 @@ class ProcessingOutputDialog(QDialog):
     def __init__(self, n_tracks=1, parent=None):
         super().__init__(parent)
         self._updating = False
-        self.setWindowTitle("Select Outputs to Compute")
+        self.setWindowTitle("Analysis Pipeline")
         self.setWindowIcon(_make_icon("export"))
         self.setMinimumWidth(430)
 
-        settings = QSettings("AUG", "STAR")
+        settings = QSettings("WangLabs", "MOSIAC")
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
 
@@ -1023,7 +1023,7 @@ class ProcessingOutputDialog(QDialog):
         self._updating = False
 
     def _accept(self):
-        settings = QSettings("AUG", "STAR")
+        settings = QSettings("WangLabs", "MOSIAC")
         settings.setValue("proc/live_zones",    self._cb_live_zones.isChecked())
         settings.setValue("proc/live_proximity", self._cb_live_prox.isChecked())
         for key, cb in self._checks.items():
@@ -1099,7 +1099,7 @@ class ExportOptionsDialog(QDialog):
     def __init__(self, output_opts=None, default_dir="", default_name="export", parent=None):
         super().__init__(parent)
         self._updating = False
-        self.setWindowTitle("Export Options")
+        self.setWindowTitle("Save Results")
         self.setWindowIcon(_make_icon("export"))
         self.setMinimumWidth(420)
 
@@ -2083,7 +2083,7 @@ class RunPopUp(QWidget):
         self._export_worker = None
         self._export_thread = None
 
-        self.setWindowTitle("ROI Selector")
+        self.setWindowTitle("MOSIAC — Analysis Session")
         self.setWindowIcon(_make_icon("roi"))
         self.showMaximized()
 

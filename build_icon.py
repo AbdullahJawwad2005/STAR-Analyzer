@@ -1,5 +1,5 @@
 """
-build_icon.py — Generate star_analyzer.ico with the Augusta-colored SLEAP skeleton icon.
+build_icon.py — Generate mosiac.ico for the MOSIAC application.
 
 Usage:
     python build_icon.py
@@ -9,57 +9,99 @@ import math
 import sys
 
 from PySide6.QtCore import Qt, QPointF, QRectF
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QBrush, QPixmap, QIcon
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QBrush, QPixmap, QLinearGradient, QRadialGradient
 from PySide6.QtWidgets import QApplication
 
 
 def _render_icon(size: int) -> QImage:
-    """Render the SLEAP-skeleton icon into a QImage of the given size."""
+    """Render the MOSIAC icon — a 2×2 mosaic grid with a tracking-dot motif."""
     px = QPixmap(size, size)
     px.fill(QColor(0, 0, 0, 0))
     p = QPainter(px)
     p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
 
-    # Dark navy-teal background
+    s = float(size)
+    r = s * 0.16   # corner radius
+
+    # --- Background: deep navy gradient ---
+    bg_grad = QLinearGradient(0, 0, s, s)
+    bg_grad.setColorAt(0.0, QColor(0x0d, 0x1b, 0x2a))
+    bg_grad.setColorAt(1.0, QColor(0x1a, 0x2e, 0x40))
     p.setPen(Qt.NoPen)
-    p.setBrush(QBrush(QColor(0x15, 0x25, 0x35)))
-    r = size * 0.18
-    p.drawRoundedRect(QRectF(0, 0, size, size), r, r)
+    p.setBrush(QBrush(bg_grad))
+    p.drawRoundedRect(QRectF(0, 0, s, s), r, r)
 
-    # Node positions: head (top), left body, right body
-    cx = size / 2.0
-    head  = QPointF(cx,              size * 0.22)
-    left  = QPointF(cx - size * 0.28, size * 0.78)
-    right = QPointF(cx + size * 0.28, size * 0.78)
+    # --- 2×2 mosaic tile grid ---
+    pad   = s * 0.12
+    gap   = s * 0.05
+    tile_w = (s - 2 * pad - gap) / 2
+    tile_h = tile_w
 
-    # Augusta green skeleton lines
-    pen = QPen(QColor(0x00, 0x79, 0x32))
-    pen.setWidthF(max(1.5, size * 0.065))
-    pen.setCapStyle(Qt.RoundCap)
-    p.setPen(pen)
-    p.drawLine(head, left)
-    p.drawLine(head, right)
-    p.drawLine(left, right)
+    tile_colors = [
+        (QColor(0x00, 0x8b, 0xd4), QColor(0x00, 0x6a, 0xaa)),  # top-left:  cyan-blue
+        (QColor(0x00, 0xc8, 0x96), QColor(0x00, 0x9a, 0x70)),  # top-right: teal-green
+        (QColor(0x7b, 0x5e, 0xff), QColor(0x59, 0x42, 0xcc)),  # bot-left:  violet
+        (QColor(0xff, 0xb8, 0x1c), QColor(0xd4, 0x90, 0x00)),  # bot-right: gold
+    ]
 
-    # Augusta gold tracking nodes
-    node_r = max(1.8, size * 0.115)
+    positions = [
+        (pad,             pad),
+        (pad + tile_w + gap, pad),
+        (pad,             pad + tile_h + gap),
+        (pad + tile_w + gap, pad + tile_h + gap),
+    ]
+
+    tile_r = s * 0.06
+    for (tx, ty), (c1, c2) in zip(positions, tile_colors):
+        tg = QLinearGradient(tx, ty, tx + tile_w, ty + tile_h)
+        tg.setColorAt(0.0, c1)
+        tg.setColorAt(1.0, c2)
+        p.setBrush(QBrush(tg))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(tx, ty, tile_w, tile_h), tile_r, tile_r)
+
+    # --- Tracking dots at tile corners / center ---
+    dot_r = max(2.0, s * 0.052)
+    dot_positions = [
+        QPointF(pad + tile_w,            pad + tile_h),           # center cross
+        QPointF(pad + tile_w / 2,        pad + tile_h / 2),       # top-left tile center
+        QPointF(pad + tile_w + gap + tile_w / 2, pad + tile_h / 2),  # top-right tile center
+        QPointF(pad + tile_w / 2,        pad + tile_h + gap + tile_h / 2),  # bot-left
+        QPointF(pad + tile_w + gap + tile_w / 2, pad + tile_h + gap + tile_h / 2),  # bot-right
+    ]
+
+    # thin connector lines between center dot and tile centers
+    line_pen = QPen(QColor(255, 255, 255, 55))
+    line_pen.setWidthF(max(1.0, s * 0.022))
+    line_pen.setCapStyle(Qt.RoundCap)
+    p.setPen(line_pen)
+    center_pt = dot_positions[0]
+    for dp in dot_positions[1:]:
+        p.drawLine(center_pt, dp)
+
+    # draw dots
     p.setPen(Qt.NoPen)
-    p.setBrush(QBrush(QColor(0xFF, 0xB8, 0x1C)))
-    for node in (head, left, right):
-        p.drawEllipse(node, node_r, node_r)
+    for i, dp in enumerate(dot_positions):
+        if i == 0:
+            # center dot: white
+            rg = QRadialGradient(dp.x(), dp.y(), dot_r)
+            rg.setColorAt(0.0, QColor(255, 255, 255, 240))
+            rg.setColorAt(1.0, QColor(220, 220, 255, 100))
+        else:
+            rg = QRadialGradient(dp.x(), dp.y(), dot_r * 0.85)
+            rg.setColorAt(0.0, QColor(255, 255, 255, 210))
+            rg.setColorAt(1.0, QColor(180, 220, 255, 80))
+        p.setBrush(QBrush(rg))
+        r_use = dot_r if i == 0 else dot_r * 0.75
+        p.drawEllipse(dp, r_use, r_use)
 
     p.end()
     return px.toImage().convertToFormat(QImage.Format_ARGB32)
 
 
 def _write_ico_manual(output_path: str, pil_images):
-    """Write an ICO file with PNG-compressed frames for all sizes.
-
-    Pillow's built-in ICO writer silently drops frames larger than 256 px.
-    This function writes the binary ICO format directly so that 512 px
-    (and any other large) frames are preserved as PNG-compressed entries,
-    which Windows Vista and later support natively.
-    """
+    """Write an ICO file with PNG-compressed frames for all sizes."""
     import io, struct
 
     png_chunks = []
@@ -69,7 +111,6 @@ def _write_ico_manual(output_path: str, pil_images):
         png_chunks.append(buf.getvalue())
 
     n = len(png_chunks)
-    # ICO layout: 6-byte file header + n*16-byte directory + image data
     header_size = 6 + n * 16
     offsets = []
     pos = header_size
@@ -78,21 +119,17 @@ def _write_ico_manual(output_path: str, pil_images):
         pos += len(chunk)
 
     with open(output_path, "wb") as f:
-        # File header
         f.write(struct.pack("<HHH", 0, 1, n))
-        # Directory entries
         for img, chunk, offset in zip(pil_images, png_chunks, offsets):
             w, h = img.size
-            # Width/height byte: 0 means 256+ (Windows reads actual size from PNG)
             bw = w if w < 256 else 0
             bh = h if h < 256 else 0
             f.write(struct.pack("<BBBBHHII", bw, bh, 0, 0, 1, 32, len(chunk), offset))
-        # Image data
         for chunk in png_chunks:
             f.write(chunk)
 
 
-def build_ico(output_path: str = "star_analyzer.ico"):
+def build_ico(output_path: str = "mosiac.ico"):
     app = QApplication.instance() or QApplication(sys.argv)
 
     sizes = [16, 32, 48, 128, 256, 512]
@@ -102,8 +139,7 @@ def build_ico(output_path: str = "star_analyzer.ico"):
         from PIL import Image
     except ImportError:
         images[1].save(output_path.replace('.ico', '.png'))
-        print(f"PIL not available; saved {output_path.replace('.ico', '.png')} instead.")
-        print("Install Pillow (`pip install Pillow`) for proper .ico generation.")
+        print(f"PIL not available; saved PNG instead. Install Pillow for .ico generation.")
         return
 
     pil_images = []
@@ -111,9 +147,6 @@ def build_ico(output_path: str = "star_analyzer.ico"):
         w, h = qimg.width(), qimg.height()
         pil_images.append(Image.frombytes("RGBA", (w, h), bytes(qimg.bits()), "raw", "BGRA"))
 
-    # Pillow's ICO saver silently drops frames > 256px.  Build the ICO manually
-    # so that all sizes (including 512px) are stored as PNG-compressed frames,
-    # which Windows Vista+ supports natively.
     _write_ico_manual(output_path, pil_images)
     print(f"Created {output_path} with sizes {sizes}")
 

@@ -5,7 +5,7 @@ import traceback
 import cv2
 
 from PySide6.QtCore import Qt, QDateTime, QPointF, QRectF
-from PySide6.QtGui import QGuiApplication, QFont, QIcon, QPixmap, QPainter, QPen, QBrush, QColor
+from PySide6.QtGui import QGuiApplication, QFont, QIcon, QPixmap, QPainter, QPen, QBrush, QColor, QLinearGradient, QRadialGradient
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -21,53 +21,87 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from run_popup import RunPopUp
 from sleap_loader import load_sleap
 
 
-def _make_star_icon(size: int = 32) -> QIcon:
-    """Create a multi-resolution SLEAP-skeleton icon in Augusta University colors."""
-    import math
+def _render_mosiac_pixmap(sz: int) -> QPixmap:
+    """Render a single MOSIAC icon pixmap — 2×2 mosaic tiles with tracking dots."""
+    px = QPixmap(sz, sz)
+    px.fill(QColor(0, 0, 0, 0))
+    p = QPainter(px)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    s = float(sz)
+    cr = s * 0.16
 
+    bg = QLinearGradient(0, 0, s, s)
+    bg.setColorAt(0.0, QColor(0x0d, 0x1b, 0x2a))
+    bg.setColorAt(1.0, QColor(0x1a, 0x2e, 0x40))
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(bg))
+    p.drawRoundedRect(QRectF(0, 0, s, s), cr, cr)
+
+    pad = s * 0.12; gap = s * 0.05
+    tw = (s - 2 * pad - gap) / 2; th = tw
+    tile_colors = [
+        (QColor(0x00, 0x8b, 0xd4), QColor(0x00, 0x6a, 0xaa)),
+        (QColor(0x00, 0xc8, 0x96), QColor(0x00, 0x9a, 0x70)),
+        (QColor(0x7b, 0x5e, 0xff), QColor(0x59, 0x42, 0xcc)),
+        (QColor(0xff, 0xb8, 0x1c), QColor(0xd4, 0x90, 0x00)),
+    ]
+    positions = [
+        (pad, pad), (pad + tw + gap, pad),
+        (pad, pad + th + gap), (pad + tw + gap, pad + th + gap),
+    ]
+    tr = s * 0.06
+    for (tx, ty), (c1, c2) in zip(positions, tile_colors):
+        tg = QLinearGradient(tx, ty, tx + tw, ty + th)
+        tg.setColorAt(0.0, c1); tg.setColorAt(1.0, c2)
+        p.setBrush(QBrush(tg)); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(tx, ty, tw, th), tr, tr)
+
+    dot_r = max(2.0, s * 0.052)
+    cx_pt = QPointF(pad + tw, pad + th)
+    tile_centers = [
+        QPointF(pad + tw / 2,        pad + th / 2),
+        QPointF(pad + tw + gap + tw / 2, pad + th / 2),
+        QPointF(pad + tw / 2,        pad + th + gap + th / 2),
+        QPointF(pad + tw + gap + tw / 2, pad + th + gap + th / 2),
+    ]
+    lp = QPen(QColor(255, 255, 255, 55))
+    lp.setWidthF(max(1.0, s * 0.022)); lp.setCapStyle(Qt.RoundCap)
+    p.setPen(lp)
+    for tc in tile_centers:
+        p.drawLine(cx_pt, tc)
+
+    p.setPen(Qt.NoPen)
+    for i, dp in enumerate([cx_pt] + tile_centers):
+        rg = QRadialGradient(dp.x(), dp.y(), dot_r)
+        if i == 0:
+            rg.setColorAt(0.0, QColor(255, 255, 255, 240))
+            rg.setColorAt(1.0, QColor(220, 220, 255, 100))
+            r_use = dot_r
+        else:
+            rg.setColorAt(0.0, QColor(255, 255, 255, 210))
+            rg.setColorAt(1.0, QColor(180, 220, 255, 80))
+            r_use = dot_r * 0.75
+        p.setBrush(QBrush(rg))
+        p.drawEllipse(dp, r_use, r_use)
+
+    p.end()
+    return px
+
+
+def _make_mosiac_icon() -> QIcon:
+    """Return a multi-resolution QIcon for MOSIAC."""
     icon = QIcon()
-    for sz in ([size] if size != 32 else [16, 32, 48, 64, 128, 256]):
-        px = QPixmap(sz, sz)
-        px.fill(QColor(0, 0, 0, 0))
-        p = QPainter(px)
-        p.setRenderHint(QPainter.Antialiasing)
-
-        # Dark navy-teal background (rounded square)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor(0x15, 0x25, 0x35)))
-        r = sz * 0.18
-        p.drawRoundedRect(QRectF(0, 0, sz, sz), r, r)
-
-        # Node positions: head (top-center), left-body, right-body
-        cx = sz / 2.0
-        head  = QPointF(cx,           sz * 0.22)
-        left  = QPointF(cx - sz*0.28, sz * 0.78)
-        right = QPointF(cx + sz*0.28, sz * 0.78)
-
-        # Augusta green skeleton lines
-        pen = QPen(QColor(0x00, 0x79, 0x32))
-        pen.setWidthF(max(1.5, sz * 0.065))
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        p.drawLine(head, left)
-        p.drawLine(head, right)
-        p.drawLine(left, right)
-
-        # Augusta gold tracking nodes
-        node_r = max(1.8, sz * 0.115)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor(0xFF, 0xB8, 0x1C)))
-        for node in (head, left, right):
-            p.drawEllipse(node, node_r, node_r)
-
-        p.end()
-        icon.addPixmap(px)
-
+    for sz in (16, 32, 48, 64, 128, 256):
+        icon.addPixmap(_render_mosiac_pixmap(sz))
     return icon
+
+
+# Keep old name as alias so any lingering references don't break at runtime.
+_make_star_icon = _make_mosiac_icon
 
 
 class _QtLogHandler(logging.Handler):
@@ -115,12 +149,12 @@ class _StderrRedirect:
 
 
 class MainWindow(QMainWindow):
-    """Main application window for loading STAR video/tracking data."""
+    """Main application window for MOSIAC — multi-animal behavioral analysis."""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("STAR Analyzer")
-        self.setWindowIcon(_make_star_icon())
+        self.setWindowTitle("MOSIAC")
+        self.setWindowIcon(_make_mosiac_icon())
         self.setMinimumSize(860, 440)
 
         self.video_path = None
@@ -195,14 +229,14 @@ class MainWindow(QMainWindow):
             QLabel#Subtitle{ color:#6a8a94; font-size:13px; }
         """)
 
-        title = QLabel("STAR Analyzer")
+        title = QLabel("MOSIAC")
         title.setObjectName("Title")
-        subtitle = QLabel("Load video, validate SLEAP tracking, define ROIs, then run behavioral analysis.")
+        subtitle = QLabel("Multi-animal pose tracking and behavioral analysis. Load a video and SLEAP file to begin.")
         subtitle.setObjectName("Subtitle")
 
         btn_video = QPushButton("Select Video")
         btn_h5 = QPushButton("Select .h5 File")
-        btn_run = QPushButton("Open ROI Selector")
+        btn_run = QPushButton("Open Analysis Session")
         for btn in (btn_video, btn_h5, btn_run):
             btn.setMinimumHeight(44)
             btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
@@ -237,7 +271,7 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(subtitle)
         status_layout.addSpacing(12)
         status_layout.addWidget(self._log, stretch=1)
-        self.log("STAR Analyzer ready. Select a video to begin.")
+        self.log("MOSIAC ready. Select a video to begin.")
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(status_frame, stretch=1)
@@ -321,6 +355,7 @@ class MainWindow(QMainWindow):
         if not self.video_path:
             self.log("Select and validate a video first.", 'warn')
             return
+        from run_popup import RunPopUp
         popup = RunPopUp(self.video_path, sleap_data=self.sleap_data)
         popup.roi_selected.connect(self._on_roi_selected)
         popup.destroyed.connect(
