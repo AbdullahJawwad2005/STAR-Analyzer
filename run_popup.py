@@ -311,6 +311,14 @@ def _run_analysis(processed_data, fps, roi, px_per_cm, strip_cm, output_opts) ->
             zone_label=zone_label,
         )
 
+    # Pre-compute P&O sheet (reuse cached gen_dist — no duplicate _general_min_dist)
+    if n_tracks >= 2 and tiers['proximity']:
+        cache['prox_orient_df'] = build_proximity_orientation_df(
+            tracks, kin, frame_map, node_names, track_names, fps, px_per_cm,
+            _gen_dist=gen_dist_tracked,
+            _gen_closest=gen_closest_tracked,
+        )
+
     return cache
 
 
@@ -439,10 +447,15 @@ class _ExportWorker(QObject):
                     tracks, kin, node_names, self._fps, single_beh, pair_beh)
                 pair_beh.update(second_order)
 
-            # ---- Behavior summary ----
-            beh_summary, engagement_idx_df = compute_behavior_summary(
-                single_beh, pair_beh, track_names, self._fps,
-                tracks=tracks, kin=kin, frame_map=frame_map, node_names=node_names)
+            # ---- Behavior summary (only when actually needed) ----
+            _need_beh = (self._want("main_behavior_summary")
+                         or self._want("main_engagement_indices"))
+            if _need_beh:
+                beh_summary, engagement_idx_df = compute_behavior_summary(
+                    single_beh, pair_beh, track_names, self._fps,
+                    tracks=tracks, kin=kin, frame_map=frame_map, node_names=node_names)
+            else:
+                beh_summary = engagement_idx_df = pd.DataFrame()
 
             # ---- Feature DataFrames (reuse precomputed arrays from cache) ----
             if track_arrays and oo.get('main_animal_features', False):
@@ -665,6 +678,7 @@ class _ExportWorker(QObject):
                 if self._want("main_key_metrics"):
                     key_metrics_df = self._cache.get('key_metrics_df')
                     if key_metrics_df is None:
+                        self.status.emit("Computing key metrics (not cached — re-run analysis to fix)…")
                         key_metrics_df = build_key_metrics_df(
                             tracks, kin, single_beh, pair_beh,
                             track_arrays, pair_arrays, frame_map,
@@ -679,10 +693,13 @@ class _ExportWorker(QObject):
                         with pd.ExcelWriter(km_path, engine="openpyxl") as km_writer:
                             key_metrics_df.to_excel(km_writer, sheet_name="Key Metrics", index=False)
                             if tracks.shape[3] >= 2:
-                                prox_df = build_proximity_orientation_df(
-                                    tracks, kin, frame_map, node_names, track_names,
-                                    self._fps, px_per_cm,
-                                )
+                                prox_df = self._cache.get('prox_orient_df')
+                                if prox_df is None:
+                                    self.status.emit("Computing P&O sheet (not cached — re-run analysis to fix)…")
+                                    prox_df = build_proximity_orientation_df(
+                                        tracks, kin, frame_map, node_names, track_names,
+                                        self._fps, px_per_cm,
+                                    )
                                 prox_df.to_excel(km_writer, sheet_name="Proximity & Orientation",
                                                  index=False)
                     except PermissionError:
@@ -2210,7 +2227,18 @@ class RunPopUp(QWidget):
         x1, y1 = int(round(rect.right())), int(round(rect.bottom()))
         self._lbl_width.setText(f"{x1 - x0} px")
         self._recompute_zones()
+
+        if self._analysis_cache is not None:
+            self._analysis_cache = None
+            self._btn_inspect.setEnabled(False)
+            try:
+                self._btn_export.setEnabled(False)
+            except AttributeError:
+                pass
+            print("[MOSIAC] ROI changed — previous analysis cleared. Click Process to re-analyze.")
+
         self._btn_process.setEnabled(True)
+        self._btn_process.setText("Process")
         self._show_frame(self._index)
 
     def _clear_roi_and_labels(self):
@@ -2273,7 +2301,28 @@ class RunPopUp(QWidget):
 
     # ---- Process -------------------------------------------------------
 
+    def _cancel_analysis(self):
+        try:
+            if self._analysis_thread is not None and self._analysis_thread.isRunning():
+                self._analysis_thread.quit()
+                self._analysis_thread.wait(500)
+        except RuntimeError:
+            pass
+        self._analysis_cache = None
+        self._btn_process.setText("Process")
+        self._btn_process.setEnabled(True)
+        self._progress_bar.setVisible(False)
+        print("[MOSIAC] Analysis cancelled.")
+
     def _run_process(self):
+        # If analysis is currently running, this click means cancel
+        try:
+            if self._analysis_thread is not None and self._analysis_thread.isRunning():
+                self._cancel_analysis()
+                return
+        except RuntimeError:
+            pass
+
         if self._sleap_data is None:
             QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first.")
             return
@@ -2358,8 +2407,8 @@ class RunPopUp(QWidget):
 
         self._progress_bar.setValue(0)
         self._progress_bar.setVisible(True)
-        self._btn_process.setEnabled(False)
-        self._btn_process.setText("Analyzing…")
+        self._btn_process.setText("Cancel Analysis")
+        self._btn_process.setEnabled(True)
 
         self._analysis_worker = _AnalysisWorker(
             data, self._fps, roi, px_per_cm, strip_cm, output_opts or {}

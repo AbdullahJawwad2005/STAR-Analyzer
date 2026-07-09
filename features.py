@@ -1065,7 +1065,10 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
     return pd.DataFrame(rows, columns=['Category','Metric','Subject','Value','Unit'])
 
 
-def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_names, fps, px_per_cm):
+def build_proximity_orientation_df(
+    tracks, kin, frame_map, node_names, track_names, fps, px_per_cm,
+    _gen_dist=None, _gen_closest=None,
+):
     """
     Build a per-second proximity and orientation DataFrame for the first animal pair.
 
@@ -1073,6 +1076,14 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
     canonical node present in node_names.
 
     Only meaningful when n_tracks >= 2; caller is responsible for that check.
+
+    Parameters
+    ----------
+    _gen_dist : array-like, optional
+        Pre-computed general min-dist array (length == len(si_arr)) from _general_min_dist.
+        If provided and the length matches, skips the recomputation.
+    _gen_closest : array-like, optional
+        Companion closest-pair name array from _general_min_dist.
     """
     n_frames, _, n_nodes, n_tracks = tracks.shape
 
@@ -1091,57 +1102,74 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
     heading_B = kin['body_heading_deg'][:, tB]
     delta_heading = np.abs(((heading_A - heading_B) + 180.0) % 360.0 - 180.0)  # [0, 180]
 
-    # General min cross-animal node-pair distance for Within_3cm / Within_1cm
-    # Exclude tailend nodes: only tailstart counts as a contact/proximity point
-    all_idxs = np.arange(n_frames)
-    gen_min_px, gen_closest = _general_min_dist(tracks, all_idxs, tA, tB, node_names,
-                                                exclude_idxs=_tailend_node_idxs(node_names))
+    # Only compute distances for SLEAP indices that appear in frame_map —
+    # those are the only indices accessed later.  This avoids allocating
+    # distance arrays for every video frame (often 2-5× more than needed).
+    sorted_si   = sorted(frame_map.values())
+    si_arr      = np.array(sorted_si)
+    si_to_pos   = {int(si): pos for pos, si in enumerate(sorted_si)}
+
+    # Use pre-computed arrays if provided (avoids duplicate _general_min_dist call)
+    if _gen_dist is not None and len(_gen_dist) == len(si_arr):
+        gen_min_px  = _gen_dist
+        gen_closest = _gen_closest
+    else:
+        gen_min_px, gen_closest = _general_min_dist(
+            tracks, si_arr, tA, tB, node_names,
+            exclude_idxs=_tailend_node_idxs(node_names))
+
     prox_px    = PROX_THRESHOLD_CM    * px_per_cm
     contact_px = CONTACT_THRESHOLD_CM * px_per_cm
 
-    # Anatomical region distances — precomputed for all frames
+    # Anatomical region distances — one slab allocation for all region calls
     head_nodes = [i for i in [nose_idx, ear_l_idx, ear_r_idx] if i is not None]
     body_nodes = [i for i in [body_idx, hip_l_idx, hip_r_idx] if i is not None]
     tail_nodes  = [i for i in [tail_idx]                       if i is not None]
 
+    tracks_sub_po = tracks[si_arr]          # one allocation for all region calls
+    xA = tracks_sub_po[:, 0, :, tA]
+    yA = tracks_sub_po[:, 1, :, tA]
+    xB = tracks_sub_po[:, 0, :, tB]
+    yB = tracks_sub_po[:, 1, :, tB]
+
     region_dist_arrays = {}
     if nose_idx is not None:
-        region_dist_arrays['nose_nose_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, [nose_idx], [nose_idx])
+        region_dist_arrays['nose_nose_dist_cm'] = _region_min_dist_slab(xA, yA, xB, yB, [nose_idx], [nose_idx])
     if head_nodes:
-        region_dist_arrays['head_head_dist_cm']  = _region_min_dist(tracks, all_idxs, tA, tB, head_nodes, head_nodes)
+        region_dist_arrays['head_head_dist_cm']  = _region_min_dist_slab(xA, yA, xB, yB, head_nodes, head_nodes)
         if body_nodes:
-            region_dist_arrays['head_body_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, head_nodes, body_nodes)
+            region_dist_arrays['head_body_dist_cm'] = _region_min_dist_slab(xA, yA, xB, yB, head_nodes, body_nodes)
         if tail_nodes:
-            region_dist_arrays['head_tail_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, head_nodes, tail_nodes)
+            region_dist_arrays['head_tail_dist_cm'] = _region_min_dist_slab(xA, yA, xB, yB, head_nodes, tail_nodes)
     if body_nodes:
-        region_dist_arrays['body_body_dist_cm']  = _region_min_dist(tracks, all_idxs, tA, tB, body_nodes, body_nodes)
+        region_dist_arrays['body_body_dist_cm']  = _region_min_dist_slab(xA, yA, xB, yB, body_nodes, body_nodes)
         if tail_nodes:
-            region_dist_arrays['body_tail_dist_cm'] = _region_min_dist(tracks, all_idxs, tA, tB, body_nodes, tail_nodes)
+            region_dist_arrays['body_tail_dist_cm'] = _region_min_dist_slab(xA, yA, xB, yB, body_nodes, tail_nodes)
     if tail_nodes:
-        region_dist_arrays['tail_tail_dist_cm']  = _region_min_dist(tracks, all_idxs, tA, tB, tail_nodes, tail_nodes)
+        region_dist_arrays['tail_tail_dist_cm']  = _region_min_dist_slab(xA, yA, xB, yB, tail_nodes, tail_nodes)
 
-    # Group frame_map into 1-second bins keyed by integer second
+    # Group frame_map into 1-second bins (values are positions in si_arr, not raw sleap idxs)
     bins = {}
     for vid_frame, sleap_idx in frame_map.items():
         sec = int(vid_frame // fps)
-        bins.setdefault(sec, []).append(sleap_idx)
+        bins.setdefault(sec, []).append(si_to_pos[int(sleap_idx)])
 
     # Bout-aware per-second marks for Within_3cm / Within_1cm
     _sorted_vf = sorted(frame_map.keys())
-    _dist_seq  = gen_min_px[np.array([frame_map[f] for f in _sorted_vf])]
+    _dist_seq  = gen_min_px[np.array([si_to_pos[int(frame_map[f])] for f in _sorted_vf])]
     prox_marks = _compute_bout_second_marks(_dist_seq, frame_map, fps, prox_px)
     cont_marks = _compute_bout_second_marks(_dist_seq, frame_map, fps, contact_px)
 
     rows = []
     for sec in sorted(bins):
-        idxs = np.array(bins[sec])
+        pos_arr = np.array(bins[sec])  # positions into gen_min_px / region arrays
 
-        gd       = gen_min_px[idxs]          # still needed for closest_pair below
+        gd       = gen_min_px[pos_arr]
         within_3 = prox_marks.get(sec, 0)
         within_1 = cont_marks.get(sec, 0)
 
         # Closest pair: mode among this second's frames
-        cp_sec = gen_closest[idxs]
+        cp_sec = gen_closest[pos_arr]
         finite_cp = cp_sec[np.isfinite(gd)]
         if len(finite_cp):
             vals, counts = np.unique(finite_cp, return_counts=True)
@@ -1149,14 +1177,15 @@ def build_proximity_orientation_df(tracks, kin, frame_map, node_names, track_nam
         else:
             closest = ''
 
-        # Heading angle
-        ha = float(np.nanmean(delta_heading[idxs]))
+        # Heading angle (delta_heading is indexed by raw sleap idx, not pos)
+        raw_si = si_arr[pos_arr]
+        ha = float(np.nanmean(delta_heading[raw_si]))
 
         row = {'Time(s)': sec, 'Within_3cm': within_3, 'Within_1cm': within_1,
                'closest_pair': closest, 'Heading_Angle_deg': round(ha, 2)}
 
         for col, arr_px in region_dist_arrays.items():
-            row[col] = round(float(np.nanmean(arr_px[idxs])) / px_per_cm, 4)
+            row[col] = round(float(np.nanmean(arr_px[pos_arr])) / px_per_cm, 4)
 
         rows.append(row)
 

@@ -112,7 +112,6 @@ a = Analysis(
         'distutils',
         # Test / docs
         'doctest',
-        'pydoc',
         'test',
         # Unused stdlib
         'xmlrpc',

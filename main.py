@@ -16,13 +16,14 @@ from PySide6.QtWidgets import QApplication
 
 from main_window import MainWindow, _make_mosiac_icon
 
+_handlers = [logging.FileHandler("mosiac.log")]
+# sys.stderr is None in windowed PyInstaller builds — only add StreamHandler when it exists
+if sys.stderr is not None:
+    _handlers.append(logging.StreamHandler())
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("mosiac.log"),
-    ],
+    handlers=_handlers,
 )
 
 
