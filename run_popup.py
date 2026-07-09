@@ -574,14 +574,15 @@ class _ExportWorker(QObject):
                 'Frame':   vid_frames_arr,
                 'Time(s)': np.round(vid_frames_arr / self._fps, 4),
             }
-            for bname in single_keys:
-                for t, tname in enumerate(track_names):
-                    beh_col[f'{tname}/{bname}'] = single_beh[bname][sleap_idxs_arr, t].astype(int)
-            for key, arr in first_order_pair_keys.items():
-                pfx, beh = key.rsplit('/', 1)
-                col_name = f'{pair_col_map[pfx]}/{beh}'
-                vals = arr[sleap_idxs_arr]
-                beh_col[col_name] = vals
+            if single_beh:
+                for bname in single_keys:
+                    for t, tname in enumerate(track_names):
+                        beh_col[f'{tname}/{bname}'] = single_beh[bname][sleap_idxs_arr, t].astype(int)
+                for key, arr in first_order_pair_keys.items():
+                    pfx, beh = key.rsplit('/', 1)
+                    col_name = f'{pair_col_map[pfx]}/{beh}'
+                    vals = arr[sleap_idxs_arr]
+                    beh_col[col_name] = vals
             beh_df = pd.DataFrame(beh_col)
 
             # 2nd Order Behaviors sheet
@@ -596,6 +597,7 @@ class _ExportWorker(QObject):
             beh2_df = pd.DataFrame(beh2_col)
 
             binned_path = None    # set inside xlsx branch; used in success message
+            km_path     = None    # set inside key_metrics block; used in success message
             graph_paths = []      # set inside xlsx branch; used in success message
             any_main = False      # set inside xlsx branch; used in success message
 
@@ -646,8 +648,7 @@ class _ExportWorker(QObject):
                 info_df = pd.DataFrame(info_rows, columns=["Parameter", "Value"])
 
                 # ---- Write main xlsx (only if at least one main sheet selected) ----
-                any_main = any(self._want(k) for k, _ in ExportOptionsDialog._MAIN_SHEETS
-                               if k != "main_key_metrics")
+                any_main = any(self._want(k) for k, _ in ExportOptionsDialog._MAIN_SHEETS)
                 if any_main:
                     self.status.emit("Writing Excel workbook…")
                     try:
@@ -772,6 +773,8 @@ class _ExportWorker(QObject):
             parts = []
             if any_main:
                 parts.append(f"Main workbook:\n{path}")
+            if km_path:
+                parts.append(f"Key Metrics:\n{km_path}")
             if binned_path:
                 parts.append(f"Binned export:\n{binned_path}")
             if graph_paths:
@@ -818,6 +821,8 @@ class ProcessingOutputDialog(QDialog):
         ("main_engagement_indices",  "Engagement Indices  [pair]"),
         ("main_animal_features",     "Animal Features"),
         ("main_pair_features",       "Pair Features  [pair]"),
+    ]
+    _KEY_METRICS_SHEET = [
         ("main_key_metrics",         "Key Metrics"),
     ]
     _BINNED_SHEETS = [
@@ -916,6 +921,7 @@ class ProcessingOutputDialog(QDialog):
         self._group_all: list[QCheckBox] = []
 
         self._build_group(scroll_layout, "Main Excel Workbook", self._MAIN_SHEETS)
+        self._build_group(scroll_layout, "Key Metrics File  (\u2192 *_key_metrics.xlsx)", self._KEY_METRICS_SHEET)
         self._build_group(scroll_layout, "Binned Excel Workbook", self._BINNED_SHEETS)
         grp_graph = self._build_group(scroll_layout, "Graph PDFs", self._GRAPH_PDFS)
         rf_grp    = self._build_group(scroll_layout, "Analysis (RF)", self._RF_ANALYSIS)
@@ -941,7 +947,7 @@ class ProcessingOutputDialog(QDialog):
 
         # Sync group-all and master after restoring
         for ga, items in zip(self._group_all, [
-                self._MAIN_SHEETS, self._BINNED_SHEETS, self._GRAPH_PDFS, self._RF_ANALYSIS]):
+                self._MAIN_SHEETS, self._KEY_METRICS_SHEET, self._BINNED_SHEETS, self._GRAPH_PDFS, self._RF_ANALYSIS]):
             self._sync_group(ga, items)
         self._sync_master()
 
@@ -1074,6 +1080,8 @@ class ExportOptionsDialog(QDialog):
         ("main_engagement_indices",  "Engagement Indices"),
         ("main_animal_features",     "Animal Features"),
         ("main_pair_features",       "Pair Features"),
+    ]
+    _KEY_METRICS_SHEET = [
         ("main_key_metrics",         "Key Metrics"),
     ]
     _BINNED_SHEETS = [
@@ -1145,6 +1153,7 @@ class ExportOptionsDialog(QDialog):
         self._group_all: list[QCheckBox] = []
 
         self._build_group(scroll_layout, "Main Excel Workbook", self._MAIN_SHEETS, oo)
+        self._build_group(scroll_layout, "Key Metrics File  (\u2192 *_key_metrics.xlsx)", self._KEY_METRICS_SHEET, oo)
         self._build_group(scroll_layout, "Binned Excel Workbook", self._BINNED_SHEETS, oo)
         self._build_group(scroll_layout, "Graph PDFs", self._GRAPH_PDFS, oo)
         self._build_group(scroll_layout, "Analysis", self._RF_ANALYSIS, oo)
@@ -1303,6 +1312,8 @@ class ExportOptionsDialog(QDialog):
         any_binned = any(opts.get(k, False) for k, _ in self._BINNED_SHEETS)
         if any_main:
             self._preview.addItem(f"{name}.xlsx")
+        if opts.get("main_key_metrics", False):
+            self._preview.addItem(f"{name}_key_metrics.xlsx")
         if any_binned:
             self._preview.addItem(f"{name}_binned.xlsx")
         for key, suffix in self._GRAPH_SUFFIXES.items():
@@ -2051,8 +2062,8 @@ class RunPopUp(QWidget):
         for btn in (self._btn_clear, self._btn_confirm):
             controls_row.addWidget(btn)
         self._btn_process = QPushButton("Process")
-        self._btn_process.setEnabled(False)
         self._btn_export  = QPushButton("Export")
+        self._btn_export.setEnabled(False)
         self._btn_inspect = QPushButton("Inspect")
         self._btn_inspect.setCheckable(True)
         self._btn_inspect.setEnabled(False)
@@ -2246,7 +2257,6 @@ class RunPopUp(QWidget):
         self.view_b.clear_roi()
         self._lbl_width.setText("—")
         self._zones = None
-        self._btn_process.setEnabled(False)
         self._show_frame(self._index)
 
     def _confirm_roi(self):
@@ -2311,6 +2321,8 @@ class RunPopUp(QWidget):
         self._analysis_cache = None
         self._btn_process.setText("Process")
         self._btn_process.setEnabled(True)
+        self._btn_export.setEnabled(False)
+        self._btn_inspect.setEnabled(False)
         self._progress_bar.setVisible(False)
         print("[MOSIAC] Analysis cancelled.")
 
@@ -2326,6 +2338,11 @@ class RunPopUp(QWidget):
         if self._sleap_data is None:
             QMessageBox.warning(self, "No SLEAP data", "Load a SLEAP .h5 file first.")
             return
+
+        if self.view.roi_native() is None:
+            QMessageBox.information(self, "No ROI", "Please draw an ROI on the frame before processing.")
+            return
+
         try:
             if self._proc_thread is not None and self._proc_thread.isRunning():
                 return
@@ -2364,6 +2381,8 @@ class RunPopUp(QWidget):
         if self._analysis_cache is not None:
             self._analysis_cache.clear()
             self._analysis_cache = None
+        self._btn_export.setEnabled(False)
+        self._btn_inspect.setEnabled(False)
         self._processed_sleap_data = processed_data
         # Don't re-enable btn_process yet — analysis worker will do it
         self._progress_bar.setVisible(True)   # keep visible for analysis phase
@@ -2400,6 +2419,8 @@ class RunPopUp(QWidget):
         if self._analysis_cache is not None:
             self._analysis_cache.clear()
             self._analysis_cache = None
+        self._btn_export.setEnabled(False)
+        self._btn_inspect.setEnabled(False)
 
         (_, _), (_, _), side = roi
         px_per_cm = side / max(self._spin_arena_cm.value(), 1)
@@ -2433,17 +2454,22 @@ class RunPopUp(QWidget):
         self._progress_bar.setVisible(False)
         self._btn_process.setEnabled(True)
         self._btn_process.setText("Process")
+        # Enable buttons BEFORE DataPopup setup so a crash there never blocks export
+        self._btn_inspect.setEnabled(True)
+        self._btn_export.setEnabled(True)
         self._metrics_panel.clear()
         if self._data_popup is None:
             self._data_popup = _DataPopup(self)
         c = cache_dict
-        self._data_popup.setup(
-            c['tracks'], c['kin'], c['single_beh'], c['pair_beh'],
-            c['track_feat'], c['pair_feat'],
-            c['node_names'], c['track_names'], self._fps, c['px_per_cm'],
-            analysis_start_vidframe=c['analysis_start_vidframe'],
-        )
-        self._btn_inspect.setEnabled(True)
+        try:
+            self._data_popup.setup(
+                c['tracks'], c['kin'], c['single_beh'], c['pair_beh'],
+                c['track_feat'], c['pair_feat'],
+                c['node_names'], c['track_names'], self._fps, c['px_per_cm'],
+                analysis_start_vidframe=c['analysis_start_vidframe'],
+            )
+        except Exception:
+            logging.getLogger(__name__).error("DataPopup.setup failed", exc_info=True)
         self._show_frame(self._index)
 
     def _on_analysis_error(self, msg):
@@ -2472,6 +2498,9 @@ class RunPopUp(QWidget):
         and file writing to _ExportWorker running on a background QThread."""
         if self._processed_sleap_data is None:
             QMessageBox.warning(self, "Not processed", "Run 'Process' first.")
+            return
+        if self._analysis_cache is None:
+            QMessageBox.warning(self, "No analysis", "Run 'Process' first to analyze the data.")
             return
         roi = self.view.roi_native()
         if roi is None:
@@ -2542,6 +2571,7 @@ class RunPopUp(QWidget):
         self._export_thread.started.connect(self._export_worker.run)
         self._export_worker.finished.connect(self._on_export_done)
         self._export_worker.error.connect(self._on_export_error)
+        self._export_worker.status.connect(self._on_export_status)
         self._export_worker.finished.connect(self._export_thread.quit)
         self._export_worker.finished.connect(self._export_worker.deleteLater)
         self._export_worker.error.connect(self._export_thread.quit)
@@ -2549,6 +2579,10 @@ class RunPopUp(QWidget):
         self._export_thread.finished.connect(self._export_thread.deleteLater)
 
         self._export_thread.start()
+
+    def _on_export_status(self, msg):
+        """Update the export button text with the current export stage."""
+        self._btn_export.setText(msg)
 
     def _on_export_done(self, msg):
         """Called on the main thread when _ExportWorker finishes successfully."""

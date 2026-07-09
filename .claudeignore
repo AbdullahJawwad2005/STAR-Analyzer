@@ -1,0 +1,56 @@
+# Dependencies & environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Data files
+*.h5
+*.hdf5
+*.csv
+*.xlsx
+*.xls
+*.analysis
+
+# Media & large binaries
+*.mp4
+*.avi
+*.mov
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.pdf
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# Logs & caches
+*.log
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Non-project files
+original.py
+CODE_REVIEW_GUIDE.md
+rf_analysis.py
+test_conversions.py
+test_oncoplot.py
+*.ico
+*.spec
+*.bat
+README.md

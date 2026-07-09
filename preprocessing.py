@@ -49,6 +49,10 @@ def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
     nan_idx = np.where(isnan)[0]
     gaps = np.split(nan_idx, np.where(np.diff(nan_idx) > 1)[0] + 1) if len(nan_idx) else []
 
+    finite_mask = np.isfinite(filled)
+    pchip = (PchipInterpolator(x[finite_mask], filled[finite_mask], extrapolate=False)
+             if finite_mask.sum() >= 2 else None)
+
     for gap in gaps:
         start, end = gap[0], gap[-1]
         gap_len = end - start + 1
@@ -56,17 +60,11 @@ def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
         if gap_len > pchip_limit:
             continue
 
-        left_idx = start - 1 if start > 0 else None
-        right_idx = end + 1 if end < n - 1 else None
-
-        if left_idx is None or right_idx is None:
+        if start == 0 or end >= n - 1:
             continue
 
-        x_known = x[np.isfinite(filled)]
-        y_known = filled[np.isfinite(filled)]
-
-        interp = PchipInterpolator(x_known, y_known, extrapolate=False)
-        filled[start:end + 1] = interp(x[start:end + 1])
+        if pchip is not None:
+            filled[start:end + 1] = pchip(x[start:end + 1])
 
     remaining_nan = np.isnan(filled)
     if np.any(remaining_nan):

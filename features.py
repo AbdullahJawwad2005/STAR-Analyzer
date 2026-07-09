@@ -833,23 +833,21 @@ def _compute_bout_second_marks(dist_seq, frame_map, fps, threshold_px):
     d = np.diff(padded.astype(np.int8))
     start_secs = {int(sorted_vf[p] // fps) for p in np.where(d == 1)[0]}
 
-    # 5. Per-second mark
-    n_exp = round(fps)
-    sec_active: dict = {}
-    sec_set:    set  = set()
-    for pos, vf in enumerate(sorted_vf):
-        sec = int(vf // fps)
-        sec_set.add(sec)
-        if qualified[pos]:
-            sec_active[sec] = sec_active.get(sec, 0) + 1
+    # 5. Per-second mark (vectorized — avoids O(n_frames) Python loop)
+    n_exp    = round(fps)
+    vf_arr   = np.asarray(sorted_vf, dtype=np.float64)
+    secs_arr = (vf_arr // fps).astype(np.int64)
+    unique_secs, sec_inv = np.unique(secs_arr, return_inverse=True)
+    sec_counts = np.bincount(sec_inv, weights=qualified.astype(np.float64),
+                             minlength=len(unique_secs))
 
     marks: dict = {}
-    for sec in sorted(sec_set):
-        n = sec_active.get(sec, 0)
+    for i, sec in enumerate(unique_secs):
+        n = int(sec_counts[i])
         if n * 2 > n_exp or (n * 2 == n_exp and sec in start_secs):
-            marks[sec] = 1
+            marks[int(sec)] = 1
         else:
-            marks[sec] = 0
+            marks[int(sec)] = 0
     return marks
 
 

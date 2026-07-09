@@ -56,6 +56,7 @@ a = Analysis(
         'sklearn.neighbors._partition_nodes',
         'h5py',
         'cv2',
+        'batch_window',
     ],
     hookspath=[],
     hooksconfig={},

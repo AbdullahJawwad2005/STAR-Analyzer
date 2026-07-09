@@ -2,7 +2,6 @@ import gc
 import logging
 import sys
 import traceback
-import cv2
 
 from PySide6.QtCore import Qt, QDateTime, QPointF, QRectF
 from PySide6.QtGui import QGuiApplication, QFont, QIcon, QPixmap, QPainter, QPen, QBrush, QColor, QLinearGradient, QRadialGradient
@@ -20,8 +19,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-from sleap_loader import load_sleap
 
 
 def _render_mosiac_pixmap(sz: int) -> QPixmap:
@@ -237,13 +234,15 @@ class MainWindow(QMainWindow):
         btn_video = QPushButton("Select Video")
         btn_h5 = QPushButton("Select .h5 File")
         btn_run = QPushButton("Open Analysis Session")
-        for btn in (btn_video, btn_h5, btn_run):
+        btn_batch = QPushButton("Batch Analysis")
+        for btn in (btn_video, btn_h5, btn_run, btn_batch):
             btn.setMinimumHeight(44)
             btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
         btn_video.clicked.connect(self.select_video)
         btn_h5.clicked.connect(self.select_h5)
         btn_run.clicked.connect(self.open_run_popup)
+        btn_batch.clicked.connect(self.open_batch)
 
         controls_layout = QVBoxLayout()
         controls_layout.setSpacing(10)
@@ -251,6 +250,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(btn_h5)
         controls_layout.addSpacing(8)
         controls_layout.addWidget(btn_run)
+        controls_layout.addWidget(btn_batch)
         controls_layout.addStretch()
 
         controls = QGroupBox("Data Setup")
@@ -338,6 +338,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            from sleap_loader import load_sleap
             self.sleap_data = load_sleap(path)
             d = self.sleap_data
             self.log(path.split('/')[-1], 'ok')
@@ -363,6 +364,15 @@ class MainWindow(QMainWindow):
         )
         self._popups.append(popup)
 
+    def open_batch(self):
+        from batch_window import BatchWindow
+        win = BatchWindow()
+        win.destroyed.connect(
+            lambda w=win: self._popups.remove(w) if w in self._popups else None
+        )
+        self._popups.append(win)
+        win.show()
+
     def _on_roi_selected(self, roi):
         self.roi = roi
         if roi:
@@ -373,6 +383,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _validate_video(path):
+        import cv2
         cap = cv2.VideoCapture(path)
         try:
             if not cap.isOpened():

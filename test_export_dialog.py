@@ -1,5 +1,5 @@
 """
-Headless tests for ExportOptionsDialog and ProcessingOptionsDialog.
+Headless tests for ExportOptionsDialog and ProcessingOutputDialog.
 Run: python test_export_dialog.py
 """
 import os, sys
@@ -10,8 +10,7 @@ from PySide6.QtCore import Qt
 
 app = QApplication.instance() or QApplication(sys.argv)
 
-# Import the classes under test
-from run_popup import ExportOptionsDialog, ProcessingOptionsDialog
+from run_popup import ExportOptionsDialog, ProcessingOutputDialog
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -25,137 +24,101 @@ def check(name, condition, detail=""):
     print(msg)
     _results.append(condition)
 
-# ---------------------------------------------------------------------------
-# 1. Basic init — no crash (the _updating bug we fixed)
-# ---------------------------------------------------------------------------
-print("\n--- 1. Init without crash ---")
-try:
-    dlg = ExportOptionsDialog(graphs_available=True, default_dir="/tmp", default_name="test")
-    check("ExportOptionsDialog instantiates without AttributeError", True)
-except AttributeError as e:
-    check("ExportOptionsDialog instantiates without AttributeError", False, str(e))
-
-try:
-    dlg2 = ExportOptionsDialog(graphs_available=False, default_dir="/tmp", default_name="test")
-    check("graphs_available=False doesn't crash", True)
-except Exception as e:
-    check("graphs_available=False doesn't crash", False, str(e))
-
-try:
-    proc_dlg = ProcessingOptionsDialog(n_tracks=2)
-    check("ProcessingOptionsDialog instantiates", True)
-except Exception as e:
-    check("ProcessingOptionsDialog instantiates", False, str(e))
-
-# ---------------------------------------------------------------------------
-# 2. _updating guard is initialized before widget signals can fire
-# ---------------------------------------------------------------------------
-print("\n--- 2. _updating guard ---")
-dlg = ExportOptionsDialog()
-check("_updating is False after init", dlg._updating is False)
-check("_updating is bool", isinstance(dlg._updating, bool))
-
-# ---------------------------------------------------------------------------
-# 3. Default state — all checks enabled and checked
-# ---------------------------------------------------------------------------
-print("\n--- 3. Default checkbox state ---")
-dlg = ExportOptionsDialog()
-opts = dlg.options()
-all_keys = (
+# All keys that can appear in ExportOptionsDialog
+_ALL_KEYS = (
     [k for k, _ in ExportOptionsDialog._MAIN_SHEETS] +
+    [k for k, _ in ExportOptionsDialog._KEY_METRICS_SHEET] +
     [k for k, _ in ExportOptionsDialog._BINNED_SHEETS] +
     [k for k, _ in ExportOptionsDialog._GRAPH_PDFS] +
     [k for k, _ in ExportOptionsDialog._RF_ANALYSIS]
 )
-check("options() has all expected keys", set(opts.keys()) == set(all_keys),
-      f"missing={set(all_keys)-set(opts.keys())} extra={set(opts.keys())-set(all_keys)}")
+_ALL_OPTS_TRUE = {k: True for k in _ALL_KEYS}
+
+# ---------------------------------------------------------------------------
+# 1. Basic init — no crash
+# ---------------------------------------------------------------------------
+print("\n--- 1. Init without crash ---")
+try:
+    dlg = ExportOptionsDialog(output_opts=_ALL_OPTS_TRUE,
+                              default_dir="/tmp", default_name="test")
+    check("ExportOptionsDialog(all opts) instantiates", True)
+except Exception as e:
+    check("ExportOptionsDialog(all opts) instantiates", False, str(e))
+
+try:
+    dlg_empty = ExportOptionsDialog()   # no opts → empty dialog
+    check("ExportOptionsDialog() (no opts) instantiates", True)
+except Exception as e:
+    check("ExportOptionsDialog() (no opts) instantiates", False, str(e))
+
+try:
+    proc_dlg = ProcessingOutputDialog(n_tracks=2)
+    check("ProcessingOutputDialog(n_tracks=2) instantiates", True)
+except Exception as e:
+    check("ProcessingOutputDialog(n_tracks=2) instantiates", False, str(e))
+
+# ---------------------------------------------------------------------------
+# 2. _updating guard is initialised before widget signals can fire
+# ---------------------------------------------------------------------------
+print("\n--- 2. _updating guard ---")
+dlg = ExportOptionsDialog(output_opts=_ALL_OPTS_TRUE)
+check("_updating is False after init", dlg._updating is False)
+check("_updating is bool", isinstance(dlg._updating, bool))
+
+# ---------------------------------------------------------------------------
+# 3. Default state — all provided opts show up as checked
+# ---------------------------------------------------------------------------
+print("\n--- 3. Default checkbox state ---")
+dlg = ExportOptionsDialog(output_opts=_ALL_OPTS_TRUE)
+opts = dlg.options()
+check("options() has all expected keys",
+      set(opts.keys()) == set(_ALL_KEYS),
+      f"missing={set(_ALL_KEYS)-set(opts.keys())} extra={set(opts.keys())-set(_ALL_KEYS)}")
 check("all options True by default", all(opts.values()),
       f"False keys: {[k for k,v in opts.items() if not v]}")
 check("master checkbox is Checked", dlg._master.checkState() == Qt.Checked)
 
 # ---------------------------------------------------------------------------
-# 4. proc_opts gating — disabled keys get unchecked and disabled
+# 4. output_opts gating — only True items appear as checkboxes
 # ---------------------------------------------------------------------------
-print("\n--- 4. proc_opts gating ---")
-proc_opts_none = {
-    "proc_single_beh": False,
-    "proc_pair_beh":   False,
-    "proc_features":   False,
-    "proc_zones":      False,
-    "proc_proximity":  False,
-}
-dlg_gated = ExportOptionsDialog(proc_opts=proc_opts_none)
-gated_opts = dlg_gated.options()
+print("\n--- 4. output_opts gating ---")
+only_tracking = {"main_tracking_data": True, "main_session_info": True}
+dlg_gated = ExportOptionsDialog(output_opts=only_tracking)
+check("only 2 checkboxes when 2 opts provided",
+      len(dlg_gated._checks) == 2,
+      f"got {len(dlg_gated._checks)} checks: {list(dlg_gated._checks)}")
+check("main_tracking_data present", "main_tracking_data" in dlg_gated._checks)
+check("main_session_info present", "main_session_info" in dlg_gated._checks)
+check("main_zone_summary absent (not in opts)", "main_zone_summary" not in dlg_gated._checks)
 
-# These should all be disabled (hence unchecked)
-should_be_gated = {
-    "main_1st_order_behaviors", "main_2nd_order_behaviors",
-    "main_behavior_summary", "main_engagement_indices",
-    "main_animal_features", "main_pair_features",
-    "main_zone_summary",
-    "binned_animal_025", "binned_pair_025", "binned_eng_indices_025",
-    "binned_animal_1s", "binned_pair_1s",
-    "graph_heatmaps", "graph_distance",
-    "graph_oncoplot", "graph_sync_oncoplot",
-    "graph_oncoplot_clean", "graph_sync_oncoplot_clean", "graph_dist_features",
-}
-for key in should_be_gated:
-    cb = dlg_gated._checks[key]
-    check(f"  gated: {key} disabled", not cb.isEnabled())
-    check(f"  gated: {key} unchecked", not cb.isChecked())
-
-# These should NOT be gated (no proc_key mapped)
-ungated = {"main_tracking_data", "main_session_info", "main_key_metrics",
-           "graph_cascade", "rf_analysis", "rf_analysis_plots"}
-for key in ungated:
-    cb = dlg_gated._checks.get(key)
-    if cb:
-        check(f"  ungated: {key} still enabled", cb.isEnabled())
+# Empty opts → no checkboxes
+dlg_none = ExportOptionsDialog(output_opts={})
+check("no checkboxes when opts empty", len(dlg_none._checks) == 0)
 
 # ---------------------------------------------------------------------------
-# 5. proc_opts partial — only pair_beh=False
+# 5. Master checkbox sync — uncheck one item → master goes partial
 # ---------------------------------------------------------------------------
-print("\n--- 5. Partial gating (proc_pair_beh=False) ---")
-dlg_partial = ExportOptionsDialog(proc_opts={"proc_pair_beh": False})
-pair_gated = ["main_2nd_order_behaviors", "main_engagement_indices",
-              "binned_eng_indices_025", "graph_sync_oncoplot", "graph_sync_oncoplot_clean"]
-pair_ungated = ["main_1st_order_behaviors", "main_animal_features",
-                "main_tracking_data", "graph_cascade"]
-for key in pair_gated:
-    cb = dlg_partial._checks[key]
-    check(f"  pair_beh gated: {key}", not cb.isEnabled() and not cb.isChecked())
-for key in pair_ungated:
-    cb = dlg_partial._checks[key]
-    check(f"  not gated: {key} still checked", cb.isChecked())
-
-# ---------------------------------------------------------------------------
-# 6. Master checkbox sync — uncheck one item -> master goes partial
-# ---------------------------------------------------------------------------
-print("\n--- 6. Master checkbox sync ---")
-dlg = ExportOptionsDialog()
-# Uncheck one item
+print("\n--- 5. Master checkbox sync ---")
+dlg = ExportOptionsDialog(output_opts=_ALL_OPTS_TRUE)
 dlg._checks["main_tracking_data"].setChecked(False)
 check("master -> PartiallyChecked after one uncheck",
       dlg._master.checkState() == Qt.PartiallyChecked)
 
-# Uncheck all items one by one
 for cb in dlg._checks.values():
     cb.setChecked(False)
 check("master -> Unchecked after all unchecked",
       dlg._master.checkState() == Qt.Unchecked)
 
-# Re-check all
 for cb in dlg._checks.values():
     cb.setChecked(True)
 check("master -> Checked after all re-checked",
       dlg._master.checkState() == Qt.Checked)
 
 # ---------------------------------------------------------------------------
-# 7. Group "All" checkbox drives children
+# 6. Group "All" checkbox drives children
 # ---------------------------------------------------------------------------
-print("\n--- 7. Group All checkbox drives children ---")
-dlg = ExportOptionsDialog()
-# Find the group_all for MAIN_SHEETS (first group = index 0)
+print("\n--- 6. Group All checkbox drives children ---")
+dlg = ExportOptionsDialog(output_opts=_ALL_OPTS_TRUE)
 grp_all_main = dlg._group_all[0]
 main_keys = [k for k, _ in ExportOptionsDialog._MAIN_SHEETS]
 
@@ -168,28 +131,45 @@ check("group All=Checked -> all children checked",
       all(dlg._checks[k].isChecked() for k in main_keys))
 
 # ---------------------------------------------------------------------------
-# 8. _updating left clean after all operations
+# 7. _updating always resets to False
 # ---------------------------------------------------------------------------
-print("\n--- 8. _updating always resets to False ---")
+print("\n--- 7. _updating always resets ---")
 check("_updating is False after sync ops", dlg._updating is False)
 
 # ---------------------------------------------------------------------------
-# 9. ProcessingOptionsDialog defaults
+# 8. ProcessingOutputDialog — defaults with current key names
 # ---------------------------------------------------------------------------
-print("\n--- 9. ProcessingOptionsDialog defaults ---")
-pdlg = ProcessingOptionsDialog(n_tracks=2)
+print("\n--- 8. ProcessingOutputDialog defaults ---")
+pdlg = ProcessingOutputDialog(n_tracks=2)
 opts = pdlg.options()
-expected_keys = {"proc_kinematics", "proc_single_beh", "proc_pair_beh",
-                 "proc_features", "proc_zones", "proc_proximity"}
-check("has all 5 proc option keys", set(opts.keys()) == expected_keys,
-      f"got: {set(opts.keys())}")
-check("all options True by default", all(opts.values()),
-      f"False: {[k for k,v in opts.items() if not v]}")
+# All output keys come from the same sheet lists as ExportOptionsDialog
+all_proc_keys = set(_ALL_KEYS) | {"live_zones", "live_proximity"}
+check("options() has all expected keys",
+      set(opts.keys()) == all_proc_keys,
+      f"missing={all_proc_keys - set(opts.keys())} extra={set(opts.keys()) - all_proc_keys}")
+check("main_tracking_data key present", "main_tracking_data" in opts)
+check("live_zones key present", "live_zones" in opts)
+check("live_proximity key present", "live_proximity" in opts)
 
-# Single track — pair options should be disabled
-pdlg_single = ProcessingOptionsDialog(n_tracks=1)
+# ---------------------------------------------------------------------------
+# 9. ProcessingOutputDialog — single-track disables pair-only options
+# ---------------------------------------------------------------------------
+print("\n--- 9. ProcessingOutputDialog single-track ---")
+pdlg_single = ProcessingOutputDialog(n_tracks=1)
 opts_single = pdlg_single.options()
-check("proc_pair_beh accessible (key exists)", "proc_pair_beh" in opts_single)
+# Pair-only keys should be False (disabled) for single track
+pair_only_keys = [k for k, _ in ProcessingOutputDialog._MAIN_SHEETS
+                  if "[pair]" in dict(ProcessingOutputDialog._MAIN_SHEETS).get(k, "")
+                  or "[pair]" in next((l for ky, l in ProcessingOutputDialog._MAIN_SHEETS if ky == k), "")]
+# Verify the pair checkbox is disabled
+pair_cb = pdlg_single._checks.get("main_2nd_order_behaviors")
+if pair_cb is not None:
+    check("main_2nd_order_behaviors disabled for 1 track", not pair_cb.isEnabled())
+else:
+    check("main_2nd_order_behaviors key exists", False, "key not in _checks")
+
+check("proc_pair_beh-gated key is False in opts",
+      opts_single.get("main_2nd_order_behaviors") is False)
 
 # ---------------------------------------------------------------------------
 # Summary

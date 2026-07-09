@@ -536,6 +536,18 @@ def build_025s_bins(track_arrays: dict,
         nB  = track_names[tB] if tB < len(track_names) else f't{tB}'
         pair_pfx_map[pfx] = (tA, tB, nA, nB)
 
+    # Pre-extract body-centre column slices once per pair — avoids re-slicing
+    # the full tracks array (O(n_frames)) on every bin iteration.
+    pair_body_pos: dict = {}
+    if body_idx is not None:
+        for _pfx, (_tA, _tB, _nA, _nB) in pair_pfx_map.items():
+            pair_body_pos[_pfx] = (
+                tracks[:, 0, body_idx, _tA],
+                tracks[:, 1, body_idx, _tA],
+                tracks[:, 0, body_idx, _tB],
+                tracks[:, 1, body_idx, _tB],
+            )
+
     # ────────────────────────────────────────────────────────────────────────
     # Animal 0.25 s bins
     # ────────────────────────────────────────────────────────────────────────
@@ -590,14 +602,12 @@ def build_025s_bins(track_arrays: dict,
                         row[col + suf] = val
 
                 # ── Recomputed within-bin covariance / correlation ──────────
-                # Proper Pearson statistics on the raw positions within this bin.
-                if body_idx is not None:
-                    xA = tracks[:, 0, body_idx, tA]
-                    yA = tracks[:, 1, body_idx, tA]
-                    xB = tracks[:, 0, body_idx, tB]
-                    yB = tracks[:, 1, body_idx, tB]
-                    cov_x, corr_x = _bin_cov_corr(xA, xB, sleap_idxs)
-                    cov_y, corr_y = _bin_cov_corr(yA, yB, sleap_idxs)
+                # Use pre-extracted arrays; pass idx_arr (ndarray) to skip
+                # the np.array(list) conversion inside _bin_cov_corr.
+                if pfx in pair_body_pos:
+                    xA, yA, xB, yB = pair_body_pos[pfx]
+                    cov_x, corr_x = _bin_cov_corr(xA, xB, idx_arr)
+                    cov_y, corr_y = _bin_cov_corr(yA, yB, idx_arr)
                     row['pos_covariance_x_bin']  = cov_x
                     row['pos_covariance_y_bin']  = cov_y
                     row['pos_correlation_x_bin'] = corr_x
