@@ -2,32 +2,87 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import median_filter
 from scipy.signal import savgol_filter
-from pykalman import KalmanFilter
 
 
 def _kalman_fill_gap(trace, gap_start, gap_end, fps):
-    """Run Kalman smoother on a local window around a NaN gap, writing back only to NaN positions."""
+    """Run Kalman RTS smoother on a local window around a NaN gap.
+
+    Hand-rolled numpy forward Kalman filter + RTS backward smoother.
+    State model: position+velocity, F=[[1,1],[0,1]], H=[[1,0]],
+    Q=eye(2)*1e-3, R=1e-2, P0=eye(2).  Numerically equivalent to pykalman.
+    """
     context = max(int(fps * 1.5), (gap_end - gap_start + 1) * 2)
     win_s = max(0, gap_start - context)
     win_e = min(len(trace), gap_end + 1 + context)
-    window = trace[win_s:win_e].copy()
+    window = trace[win_s:win_e].astype(np.float64)
 
     finite_vals = window[np.isfinite(window)]
     if len(finite_vals) < 3:
         return
 
-    kf = KalmanFilter(
-        transition_matrices=[[1, 1], [0, 1]],
-        observation_matrices=[[1, 0]],
-        transition_covariance=np.eye(2) * 1e-3,
-        observation_covariance=np.eye(1) * 1e-2,
-        initial_state_mean=[float(finite_vals[0]), 0],
-    )
-    smoothed_means, _ = kf.smooth(window)
+    n = len(window)
+
+    # State-model constants (2-D state: position, velocity)
+    F  = np.array([[1.0, 1.0], [0.0, 1.0]])
+    FT = F.T
+    H  = np.array([[1.0, 0.0]])
+    HT = H.T
+    Q  = np.eye(2) * 1e-3
+    R  = 1e-2           # scalar observation noise
+    I2 = np.eye(2)
+
+    # Initial state (match pykalman default: P0 = eye(2))
+    m = np.array([float(finite_vals[0]), 0.0])
+    P = np.eye(2)
+
+    # Storage for forward pass
+    ms_pred = np.empty((n, 2))
+    Ps_pred = np.empty((n, 2, 2))
+    ms_filt = np.empty((n, 2))
+    Ps_filt = np.empty((n, 2, 2))
+
+    # ── Forward Kalman filter ──────────────────────────────────────────────
+    for k in range(n):
+        m_pred = F @ m
+        P_pred = F @ P @ FT + Q
+
+        ms_pred[k] = m_pred
+        Ps_pred[k] = P_pred
+
+        obs = window[k]
+        if np.isfinite(obs):                       # observed frame
+            innov = obs - (H @ m_pred)[0]
+            S     = (H @ P_pred @ HT)[0, 0] + R   # scalar innovation cov
+            K     = (P_pred @ HT) / S              # (2,1) Kalman gain
+            m = m_pred + K[:, 0] * innov
+            P = (I2 - K @ H) @ P_pred
+        else:                                      # missing frame — predict only
+            m = m_pred
+            P = P_pred
+
+        ms_filt[k] = m
+        Ps_filt[k] = P
+
+    # ── RTS backward smoother ─────────────────────────────────────────────
+    ms_smooth = np.empty((n, 2))
+    Ps_smooth = np.empty((n, 2, 2))
+    ms_smooth[-1] = ms_filt[-1]
+    Ps_smooth[-1] = Ps_filt[-1]
+
+    for k in range(n - 2, -1, -1):
+        M   = Ps_pred[k + 1]                        # 2×2, always PSD → invertible
+        det = M[0, 0] * M[1, 1] - M[0, 1] * M[1, 0]
+        Mi  = np.array([[ M[1, 1], -M[0, 1]],
+                        [-M[1, 0],  M[0, 0]]]) / det  # closed-form 2×2 inverse
+        G = Ps_filt[k] @ FT @ Mi
+        ms_smooth[k] = ms_filt[k] + G @ (ms_smooth[k + 1] - ms_pred[k + 1])
+        Ps_smooth[k] = Ps_filt[k] + G @ (Ps_smooth[k + 1] - Ps_pred[k + 1]) @ G.T
+
+    smoothed_pos = ms_smooth[:, 0]
 
     for i in range(gap_start, gap_end + 1):
         if np.isnan(trace[i]):
-            trace[i] = smoothed_means[i - win_s, 0]
+            trace[i] = smoothed_pos[i - win_s]
 
 
 def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
@@ -71,7 +126,10 @@ def hybrid_convergent_fill(trace, fps=24, pchip_time_s=0.25):
         nan_idx2 = np.where(remaining_nan)[0]
         gaps2 = np.split(nan_idx2, np.where(np.diff(nan_idx2) > 1)[0] + 1)
         for gap in gaps2:
-            _kalman_fill_gap(filled, int(gap[0]), int(gap[-1]), fps)
+            g_start, g_end = int(gap[0]), int(gap[-1])
+            if g_start == 0 or g_end >= n - 1:
+                continue   # edge gaps: let constant edge-fill below handle them
+            _kalman_fill_gap(filled, g_start, g_end, fps)
 
     if np.any(np.isnan(filled)):
         mask = np.isfinite(filled)
@@ -330,6 +388,18 @@ def compute_kinematics(tracks, fps, sg_win=3, sg_poly=3, node_names=None):
     }
 
 
+def _process_one_track(track_data, fps, med_win, sg_win, poly):
+    """Fill and smooth one track.  track_data: (n_frames, n_nodes, 2) float32."""
+    coords = track_data.copy()
+    n_nodes = coords.shape[1]
+    for node_idx in range(n_nodes):
+        for axis_idx in range(2):
+            coords[:, node_idx, axis_idx] = hybrid_convergent_fill(
+                coords[:, node_idx, axis_idx], fps=fps
+            )
+    return smooth_sleap_allnodes(coords, med_win=med_win, sg_win=sg_win, poly=poly)
+
+
 def fill_and_smooth_tracks(tracks, fps, med_win=3, sg_win=5, poly=2, progress_callback=None):
     """
     Input:
@@ -346,31 +416,52 @@ def fill_and_smooth_tracks(tracks, fps, med_win=3, sg_win=5, poly=2, progress_ca
     if n_axes != 2:
         raise ValueError(f"Expected axis dimension of size 2, got {n_axes}")
 
-    total_steps = n_tracks * n_nodes * 2
-    step = 0
+    # Parallelize per-track when the problem is large enough to amortise
+    # loky process-pool overhead (~5-50 ms per worker spawn).
+    use_parallel = (n_tracks * n_nodes * 2 > 16) and (n_frames > 5000)
 
-    for track_idx in range(n_tracks):
-        # Convert one track to old format: (frames, nodes, 2)
-        coords = processed[:, :, :, track_idx].transpose(0, 2, 1)
+    if use_parallel:
+        from joblib import Parallel, delayed
 
-        for node_idx in range(n_nodes):
-            for axis_idx in range(2):
-                coords[:, node_idx, axis_idx] = hybrid_convergent_fill(
-                    coords[:, node_idx, axis_idx],
-                    fps=fps,
-                )
-                step += 1
-                if progress_callback:
-                    progress_callback(int(step * 100 / total_steps))
+        track_inputs = [
+            processed[:, :, :, t].transpose(0, 2, 1)   # (n_frames, n_nodes, 2)
+            for t in range(n_tracks)
+        ]
 
-        coords = smooth_sleap_allnodes(
-            coords,
-            med_win=med_win,
-            sg_win=sg_win,
-            poly=poly,
+        results = Parallel(n_jobs=-1, backend='loky')(
+            delayed(_process_one_track)(td, fps, med_win, sg_win, poly)
+            for td in track_inputs
         )
 
-        # Convert back to current app format: (frames, 2, nodes)
-        processed[:, :, :, track_idx] = coords.transpose(0, 2, 1)
+        for t, coords in enumerate(results):
+            processed[:, :, :, t] = coords.transpose(0, 2, 1)
+            if progress_callback:
+                progress_callback(int((t + 1) * 100 / n_tracks))
+    else:
+        total_steps = n_tracks * n_nodes * 2
+        step = 0
+
+        for track_idx in range(n_tracks):
+            # Convert one track to (n_frames, n_nodes, 2)
+            coords = processed[:, :, :, track_idx].transpose(0, 2, 1)
+
+            for node_idx in range(n_nodes):
+                for axis_idx in range(2):
+                    coords[:, node_idx, axis_idx] = hybrid_convergent_fill(
+                        coords[:, node_idx, axis_idx],
+                        fps=fps,
+                    )
+                    step += 1
+                    if progress_callback:
+                        progress_callback(int(step * 100 / total_steps))
+
+            coords = smooth_sleap_allnodes(
+                coords,
+                med_win=med_win,
+                sg_win=sg_win,
+                poly=poly,
+            )
+
+            processed[:, :, :, track_idx] = coords.transpose(0, 2, 1)
 
     return processed

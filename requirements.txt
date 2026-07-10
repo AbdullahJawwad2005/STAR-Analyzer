@@ -6,5 +6,6 @@ pandas
 openpyxl
 scipy
 pykalman
+joblib
 matplotlib
 scikit-learn

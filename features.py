@@ -820,8 +820,8 @@ def _compute_bout_second_marks(dist_seq, frame_map, fps, threshold_px):
     # 1. Frame-level binary
     raw = (np.isfinite(dist_seq) & (dist_seq <= threshold_px)).astype(np.int8)
 
-    # 2. Jitter removal: fill gaps < 0.2 s
-    max_gap = max(1, round(0.2 * fps))
+    # 2. Jitter removal: fill gaps < 0.1 s
+    max_gap = max(1, round(0.1 * fps))
     filled  = _fill_short_gaps(raw, max_gap)
 
     # 3. Minimum-bout filter: keep only runs >= 1 second
@@ -907,8 +907,14 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
         _add('Locomotion', 'Median Speed', tname, float(np.nanmedian(spd_cm)), 'cm/s')
         _add('Locomotion', 'P95 Speed', tname, float(np.nanpercentile(spd_cm, 95)), 'cm/s')
 
-        # Scalar absolute acceleration: |d(speed)/dt|, averaged over all frames
-        abs_acc = np.abs(_speed_accel(spd_cm, fps))
+        # Vector acceleration magnitude: sqrt(ax^2 + ay^2) from SG 2nd derivative.
+        # This captures both linear and centripetal (turning) acceleration, unlike
+        # d(speed)/dt which goes to zero for constant-speed turns.
+        if body_idx is not None:
+            acc_px = kin['accel'][sleap_idxs, body_idx, t]
+        else:
+            acc_px = np.nanmean(kin['accel'][sleap_idxs, :, t], axis=1)
+        abs_acc = acc_px / px_per_cm
         _add('Locomotion', 'Avg Abs Acceleration', tname,
              float(np.nanmean(abs_acc)), 'cm/s²')
         _add('Locomotion', 'P95 Abs Acceleration', tname,
@@ -963,6 +969,12 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
     n_nodes_total = tracks.shape[2]
     active_nodes = [i for i in range(n_nodes_total) if i not in tailend_excl]
 
+    # Mapping needed to reorder gen_dist from sleap_idx order → video-frame order
+    # so that _compute_bout_second_marks gets a temporally-correct sequence.
+    _si_to_pos = {int(si): pos for pos, si in enumerate(sleap_idxs)}
+    _sorted_vf = sorted(frame_map.keys())
+    _vf_reorder = np.array([_si_to_pos[int(frame_map[vf])] for vf in _sorted_vf])
+
     # Anatomical region definitions (same for every pair)
     head_nodes = [i for i in [nose_idx, ear_l_idx, ear_r_idx] if i is not None]
     body_nodes = [i for i in [body_idx, hip_l_idx, hip_r_idx] if i is not None]
@@ -1005,13 +1017,16 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
             if tail_nodes:
                 dist_pairs['Tail-Tail']  = _region_min_dist_slab(xA, yA, xB, yB, tail_nodes, tail_nodes)
 
-            # Proximity and contact times (1-second minimum bout filter)
+            # Proximity and contact times (gap-fill + 1-second minimum bout filter)
+            _gap = max(1, round(0.1 * fps))
             for label, dist_arr in dist_pairs.items():
                 prox_bin = np.isfinite(dist_arr) & (dist_arr <= prox_thresh_px)
+                prox_bin = _fill_short_gaps(prox_bin.astype(np.int8), _gap).astype(bool)
                 prox_bin = _filter_short_active_bouts(prox_bin, fps)
                 prox_frames = float(np.nansum(prox_bin))
 
                 cont_bin = np.isfinite(dist_arr) & (dist_arr <= contact_thresh_px)
+                cont_bin = _fill_short_gaps(cont_bin.astype(np.int8), _gap).astype(bool)
                 cont_bin = _filter_short_active_bouts(cont_bin, fps)
                 contact_frames = float(np.nansum(cont_bin))
 
@@ -1029,18 +1044,23 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
             with np.errstate(all='ignore'):
                 gen_dist = np.nanmin(np.hypot(dx_all, dy_all).reshape(len(sleap_idxs), -1), axis=1)
             gen_prox_bin = np.isfinite(gen_dist) & (gen_dist <= prox_thresh_px)
+            gen_prox_bin = _fill_short_gaps(gen_prox_bin.astype(np.int8), _gap).astype(bool)
             gen_prox_bin = _filter_short_active_bouts(gen_prox_bin, fps)
             _add('Proximity', 'General Proximity Time (2dp)', pair_name,
                  round(float(np.nansum(gen_prox_bin)) / fps, 2), 's')
 
             gen_cont_bin = np.isfinite(gen_dist) & (gen_dist <= contact_thresh_px)
+            gen_cont_bin = _fill_short_gaps(gen_cont_bin.astype(np.int8), _gap).astype(bool)
             gen_cont_bin = _filter_short_active_bouts(gen_cont_bin, fps)
             _add('Contact', 'General Contact Time (2dp)', pair_name,
                  round(float(np.nansum(gen_cont_bin)) / fps, 2), 's')
 
-            # Binned: whole-second counts from the P&O sheet logic (≥1 s bouts, gap-filled)
-            prox_marks_km = _compute_bout_second_marks(gen_dist, frame_map, fps, prox_thresh_px)
-            cont_marks_km = _compute_bout_second_marks(gen_dist, frame_map, fps, contact_thresh_px)
+            # Binned: whole-second counts matching the P&O sheet.
+            # gen_dist is in sleap_idxs order; reorder to sorted video-frame order
+            # so _compute_bout_second_marks sees a temporally-correct sequence.
+            gen_dist_vf = gen_dist[_vf_reorder]
+            prox_marks_km = _compute_bout_second_marks(gen_dist_vf, frame_map, fps, prox_thresh_px)
+            cont_marks_km = _compute_bout_second_marks(gen_dist_vf, frame_map, fps, contact_thresh_px)
             _add('Proximity', 'General Proximity Time (1s bouts)', pair_name,
                  float(sum(prox_marks_km.values())), 's')
             _add('Contact', 'General Contact Time (1s bouts)', pair_name,
@@ -1054,7 +1074,7 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                 if np.any(prox_mask):
                     app_A = pair_arrays[app_A_key][sleap_idxs][prox_mask]
                     app_B = pair_arrays[app_B_key][sleap_idxs][prox_mask]
-                    mean_angle = float(np.nanmean(app_A + app_B))
+                    mean_angle = float((np.nanmean(app_A) + np.nanmean(app_B)) / 2)
                 else:
                     mean_angle = float('nan')
                 _add('Proximity', 'Mean Angle When Proximal', pair_name,
