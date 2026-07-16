@@ -414,7 +414,7 @@ class _ExportWorker(QObject):
 
     def _want(self, key: str) -> bool:
         """Return True if export option *key* is enabled (default True if not set)."""
-        return self._opts.get(key, True)
+        return self._opts.get(key, False)
 
     def run(self):
         """Execute the full export pipeline; emit finished or error when done."""
@@ -1136,7 +1136,7 @@ class ExportOptionsDialog(QDialog):
 
         # ---- Master checkbox ----
         self._master = QCheckBox("Select All Outputs")
-        self._master.setChecked(True)
+        self._master.setChecked(False)
         self._master.setTristate(True)
         self._master.stateChanged.connect(self._on_master_changed)
         layout.addWidget(self._master)
@@ -1221,7 +1221,7 @@ class ExportOptionsDialog(QDialog):
         vbox = QVBoxLayout(grp)
 
         grp_all = QCheckBox("All")
-        grp_all.setChecked(True)
+        grp_all.setChecked(False)
         grp_all.setTristate(True)
         grp_all.stateChanged.connect(
             lambda _st, g=grp_all, it=computed: self._on_group_changed(g, it))
@@ -1230,7 +1230,7 @@ class ExportOptionsDialog(QDialog):
 
         for key, label in computed:
             cb = QCheckBox(label)
-            cb.setChecked(True)
+            cb.setChecked(False)
             cb.stateChanged.connect(
                 lambda _st, g=grp_all, it=computed: self._sync_group(g, it))
             self._checks[key] = cb

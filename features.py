@@ -1035,6 +1035,26 @@ def build_key_metrics_df(tracks, kin, single_beh, pair_beh,
                 _add('Contact', f'{label} Contact Time', pair_name,
                      contact_frames / fps, 's')
 
+                # Binned: 30s and 1-min windows for this region pair.
+                for bin_dur in (30, 60):
+                    prox_by_bin: dict = {}
+                    cont_by_bin: dict = {}
+                    for i, vf in enumerate(_sorted_vf):
+                        b = int(vf / fps // bin_dur)
+                        pos = _vf_reorder[i]
+                        prox_by_bin[b] = prox_by_bin.get(b, 0.0) + float(prox_bin[pos])
+                        cont_by_bin[b] = cont_by_bin.get(b, 0.0) + float(cont_bin[pos])
+                    for b in sorted(prox_by_bin):
+                        lo = b * bin_dur
+                        hi = lo + bin_dur
+                        lbl = (f'{lo}\u2013{hi}s'
+                               if bin_dur == 30
+                               else f'{lo // 60}\u2013{hi // 60}min')
+                        _add('Proximity', f'{lbl} {label} Proximity Time', pair_name,
+                             round(prox_by_bin[b] / fps, 2), 's')
+                        _add('Contact',   f'{lbl} {label} Contact Time',   pair_name,
+                             round(cont_by_bin.get(b, 0.0) / fps, 2), 's')
+
             # General proximity/contact — minimum over all cross-animal node pairs
             # Exclude tailend nodes: only tailstart counts as a contact/proximity point
             xa_all = xA[:, active_nodes]; ya_all = yA[:, active_nodes]

@@ -4,6 +4,109 @@ from scipy.ndimage import median_filter
 from scipy.signal import savgol_filter
 
 
+def _mask_2d_speed_outliers(coords, fps, n_sigma=5.0):
+    """Two-pass outlier masking on (n_frames, n_nodes, 2) coords.
+
+    Pass 1 — bilateral 2D speed check: iteratively flags isolated single-frame
+    teleportations.  A frame is only flagged when the speed *into* it AND the
+    speed *out of* it both exceed the robust threshold, preventing valid fast
+    movements from being discarded.
+
+    Pass 2 — rolling-median deviation check: flags multi-frame identity swaps.
+    Uses a ~2 s median-filter baseline and a 15 px floor to avoid over-masking
+    slow-moving animals.
+
+    Both passes set flagged frames to NaN (x and y) so the gap-filler sees
+    them as missing observations rather than trusted position anchors.
+
+    Parameters
+    ----------
+    coords : (n_frames, n_nodes, 2) float array — raw SLEAP observations
+    fps    : float
+    n_sigma: float — robust-sigma multiplier (default 5.0)
+
+    Returns
+    -------
+    (n_frames, n_nodes, 2) float32 array with outlier frames set to NaN
+    """
+    coords = coords.copy().astype(np.float64)
+    n_frames, n_nodes, _ = coords.shape
+    win = max(3, int(round(fps * 2.0)))   # ~2 s rolling window
+    if win % 2 == 0:
+        win += 1
+
+    for node in range(n_nodes):
+        xy = coords[:, node, :]   # (n_frames, 2)  — view into coords copy
+
+        # ── Pass 1: bilateral 2D speed check ────────────────────────────────
+        changed = True
+        while changed:
+            changed = False
+            finite_mask = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+            finite_idx = np.where(finite_mask)[0]
+            if len(finite_idx) < 3:
+                break
+
+            dxy = np.diff(xy[finite_idx], axis=0)               # (m-1, 2)
+            dt_frames = np.diff(finite_idx).astype(np.float64)  # (m-1,)
+            speed = np.hypot(dxy[:, 0], dxy[:, 1]) / dt_frames  # px/frame
+
+            med = np.median(speed)
+            mad = np.median(np.abs(speed - med))
+            threshold = med + n_sigma * mad * 1.4826   # 1.4826 = 1/Φ⁻¹(0.75)
+
+            newly_flagged = set()
+            for i in range(len(finite_idx) - 1):
+                if speed[i] > threshold and i + 1 < len(speed):
+                    if speed[i + 1] > threshold:
+                        newly_flagged.add(finite_idx[i + 1])
+
+            if newly_flagged:
+                for fi in newly_flagged:
+                    xy[fi, :] = np.nan
+                changed = True
+
+        # ── Pass 2: rolling-median deviation check ───────────────────────────
+        finite_mask = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+        if finite_mask.sum() < 3:
+            coords[:, node, :] = xy
+            continue
+
+        # Cheap linear fill just to build a smooth baseline
+        x_ax = np.arange(n_frames, dtype=np.float64)
+        xy_filled = xy.copy()
+        for ax in range(2):
+            col = xy[:, ax]
+            fin = np.isfinite(col)
+            if fin.sum() >= 2:
+                xy_filled[:, ax] = np.interp(x_ax, x_ax[fin], col[fin])
+            else:
+                xy_filled[:, ax] = np.nanmean(col) if fin.any() else 0.0
+
+        baseline_x = median_filter(xy_filled[:, 0], size=win)
+        baseline_y = median_filter(xy_filled[:, 1], size=win)
+
+        # Deviation of original finite observations from the baseline
+        fin_orig = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+        dev = np.full(n_frames, np.nan)
+        dev[fin_orig] = np.hypot(
+            xy[fin_orig, 0] - baseline_x[fin_orig],
+            xy[fin_orig, 1] - baseline_y[fin_orig],
+        )
+
+        dev_finite = dev[np.isfinite(dev)]
+        if len(dev_finite) >= 3:
+            med_dev = np.median(dev_finite)
+            mad_dev = np.median(np.abs(dev_finite - med_dev))
+            thr_dev = max(med_dev + n_sigma * mad_dev * 1.4826, 15.0)
+            flag = fin_orig & (dev > thr_dev)
+            xy[flag, :] = np.nan
+
+        coords[:, node, :] = xy
+
+    return coords.astype(np.float32)
+
+
 def _kalman_fill_gap(trace, gap_start, gap_end, fps):
     """Run Kalman RTS smoother on a local window around a NaN gap.
 
@@ -391,6 +494,7 @@ def compute_kinematics(tracks, fps, sg_win=3, sg_poly=3, node_names=None):
 def _process_one_track(track_data, fps, med_win, sg_win, poly):
     """Fill and smooth one track.  track_data: (n_frames, n_nodes, 2) float32."""
     coords = track_data.copy()
+    coords = _mask_2d_speed_outliers(coords, fps=fps)
     n_nodes = coords.shape[1]
     for node_idx in range(n_nodes):
         for axis_idx in range(2):
@@ -444,6 +548,7 @@ def fill_and_smooth_tracks(tracks, fps, med_win=3, sg_win=5, poly=2, progress_ca
         for track_idx in range(n_tracks):
             # Convert one track to (n_frames, n_nodes, 2)
             coords = processed[:, :, :, track_idx].transpose(0, 2, 1)
+            coords = _mask_2d_speed_outliers(coords, fps=fps)
 
             for node_idx in range(n_nodes):
                 for axis_idx in range(2):
